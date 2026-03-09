@@ -9,7 +9,8 @@ Research project
 with Conor and Aaro
 """
 import numpy as np
-import gym
+# pip install gymnasium
+import gymnasium as gym
 import math
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -780,8 +781,8 @@ plt.show()
 #%%
 vpi_estimate.to_csv('vpi_estimate_m.csv', index=False) # Saves the calculated VPI estimates to a CSV file.
 print('vpi_estimate saved to vpi_estimate_m.csv') # Confirms the file saving to the user.
-from google.colab import files # Imports the files utility from Google Colab.
-files.download('vpi_estimate_m.csv') # Triggers a download of the CSV file to the user's local machine.
+#from google.colab import files # Imports the files utility from Google Colab.
+#files.download('vpi_estimate_m.csv') # Triggers a download of the CSV file to the user's local machine.
 
 #%% New from here
 # Ideas
