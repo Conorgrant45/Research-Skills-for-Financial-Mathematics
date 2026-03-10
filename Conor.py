@@ -1,19 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Research project - Adaptive Model-Based Discretization
-Authors: Kyle McGillivray, Conor, Aaro
-
-Implements Section 6.1 of Jin, Xu, Yang (2025): "A one-dimensional example"
-
-Paper setup (Section 6.1):
-  - State space: S = R, action space: [0, 10]
-  - Dynamics:  mu_h(x,a) = 0.05 - 0.1x + 0.01a
-               sigma_h(x,a) = 0.1 (constant)
-               X_1 = 4
-  - Reward:    R_h(x,a) ~ N((x-a)^2, 0.01) for h in [H-1]
-  - H = 10, K = 2000, rho = 10
-"""
 import numpy as np
 import math
 import pandas as pd
@@ -149,7 +133,7 @@ class LinearDiffEnvironment(Environment):
 
 class Experiment:
     """Runs episodes and collects cumulative rewards for one agent-environment pair."""
-    __slots__ = ('env', 'agent', 'nEps', 'epLen', 'data', '_seed')
+    __slots__ = ('env', 'agent', 'nEps', 'epLen', 'data', 'arms', '_seed')
 
     def __init__(self, env: Environment, agent: Agent, cfg: ExpConfig, seed: int):
         self.env = env
@@ -157,10 +141,11 @@ class Experiment:
         self.nEps = cfg.nEps
         self.epLen = env.get_epLen()
         self.data = np.zeros(self.nEps, dtype=np.float64)
+        self.arms = np.zeros(self.nEps, dtype=np.float64)
         self._seed = seed
 
-    def run(self) -> np.ndarray:
-        """Execute all episodes and return array of per-episode rewards."""
+    def run(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Execute all episodes and return arrays of per-episode rewards and active balls."""
         np.random.seed(self._seed)
 
         env_reset = self.env.reset
@@ -168,9 +153,11 @@ class Experiment:
         agent_update_policy = self.agent.update_policy
         agent_pick_action = self.agent.pick_action
         agent_update_obs = self.agent.update_obs
+        agent_get_num_arms = self.agent.get_num_arms
         env_state = self.env
         epLen = self.epLen
         data = self.data
+        arms = self.arms
 
         for ep in range(self.nEps):
             env_reset()
@@ -190,8 +177,9 @@ class Experiment:
                 state[0] = new_state[0]
 
             data[ep] = epReward
+            arms[ep] = agent_get_num_arms()
 
-        return data
+        return data, arms
 
 
 class Node:
@@ -514,41 +502,48 @@ class AdaptiveModelBasedDiscretization(Agent):
         return np.array([np.random.uniform(lo, hi)], dtype=np.float64)
 
 
-def run_one_seed(seed: int, cfg: ExpConfig) -> np.ndarray:
+def run_one_seed(seed: int, cfg: ExpConfig) -> Tuple[np.ndarray, np.ndarray]:
     """Execute a single experiment run with the given random seed."""
     env = LinearDiffEnvironment(cfg)
     agent = AdaptiveModelBasedDiscretization(cfg)
     exp = Experiment(env, agent, cfg, seed)
-    return exp.run()
+    rewards, arms = exp.run()
+    return rewards, arms
 
 
-def run_experiment(configs: List[ExpConfig], n_jobs: int = -1) -> Dict[str, np.ndarray]:
+def run_experiment(configs: List[ExpConfig], n_jobs: int = -1) -> Dict[str, Dict[str, np.ndarray]]:
     """Run experiments for all configurations, parallelizing across seeds."""
     results = {}
 
     for cfg in configs:
         print(f"\n--- Running: {cfg.label} ---")
 
-        seed_rewards = Parallel(n_jobs=n_jobs, prefer="threads")(
+        seed_runs = Parallel(n_jobs=n_jobs, prefer="threads")(
             delayed(run_one_seed)(seed, cfg) for seed in range(cfg.n_seeds)
         )
 
-        matrix = np.vstack(seed_rewards)
-        results[cfg.label] = matrix.mean(axis=0)
+        reward_matrix = np.vstack([r for r, a in seed_runs])
+        arm_matrix = np.vstack([a for r, a in seed_runs])
 
-        final_mean = results[cfg.label][-100:].mean()
+        results[cfg.label] = {
+            "vpi": reward_matrix.mean(axis=0),
+            "arms": arm_matrix.mean(axis=0)
+        }
+
+        final_mean = results[cfg.label]["vpi"][-100:].mean()
         print(f"    Done. Final mean VPI: {final_mean:.3f}")
 
     return results
 
 
-def plot_vpi(results: Dict[str, np.ndarray], smooth_window: int = 50,
+def plot_vpi(results: Dict[str, Dict[str, np.ndarray]], smooth_window: int = 50,
              save_path: str = 'vpi_section6_1.png') -> None:
     """Plot VPI convergence curves with smoothing."""
     fig, ax = plt.subplots(figsize=(10, 6))
     colours = plt.cm.tab10(np.linspace(0, 0.8, len(results)))
 
-    for (label, vpi), colour in zip(results.items(), colours):
+    for (label, series), colour in zip(results.items(), colours):
+        vpi = series["vpi"]
         episodes = np.arange(len(vpi))
 
         cumsum = np.cumsum(np.insert(vpi, 0, 0))
@@ -603,7 +598,12 @@ if __name__ == '__main__':
     results = run_experiment([CFG_6_1], n_jobs=-1)
     plot_vpi(results, smooth_window=50, save_path='vpi_section6_1.png')
 
-    df = pd.DataFrame(results)
-    df.index.name = 'episode'
-    df.to_csv('vpi_section6_1.csv', index=False)
-    print('Data saved to vpi_section6_1.csv')
+    df_vpi = pd.DataFrame({k: v["vpi"] for k, v in results.items()})
+    df_vpi.index.name = 'episode'
+    df_vpi.to_csv('vpi_section6_1.csv', index=False)
+
+    df_arms = pd.DataFrame({k: v["arms"] for k, v in results.items()})
+    df_arms.index.name = 'episode'
+    df_arms.to_csv('arms_section6_1.csv', index=False)
+
+    print('Data saved to vpi_section6_1.csv and arms_section6_1.csv')
