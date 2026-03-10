@@ -1320,8 +1320,118 @@ def print_delayed_reward_summary(results: Dict[str, Dict]) -> None:
     
     print("=" * 70)
 
-
-
+def run_challenging_delayed_reward(n_jobs: int = -1) -> Dict[str, Dict]:
+    """
+    Environment where Bellman MUST outperform One-Step.
+    
+    Key changes:
+    - Goal AWAY from natural equilibrium
+    - Larger action effect
+    - Dynamics push AWAY from goal
+    """
+    results = {}
+    
+    configs = [
+        # Bellman
+        ExpConfig(
+            state_dim=1, action_dim=1, epLen=10, nEps=3000, n_seeds=10,
+            starting_state=0.0,      # Start at origin
+            domain_lo=-50.0, domain_hi=50.0,
+            rho=10.0, rho_1=5.0, split_threshold=2, alpha=0.5,
+            theta_0=0.0,             # No constant drift
+            theta_x=0.1,             # POSITIVE feedback (unstable, pushes away from 0)
+            theta_a=0.5,             # LARGE action effect (actions matter!)
+            sigma=0.1, delta=1.0,
+            reward_step_fn=reward_6_1,
+            label='Bellman (Challenging)',
+            use_bellman=True,
+            initial_q=10.0,
+            lip=0.1,
+            scaling=5.0,
+            inherit_flag=False,
+        ),
+        # One-Step
+        ExpConfig(
+            state_dim=1, action_dim=1, epLen=10, nEps=3000, n_seeds=10,
+            starting_state=0.0,
+            domain_lo=-50.0, domain_hi=50.0,
+            rho=10.0, rho_1=5.0, split_threshold=2, alpha=0.5,
+            theta_0=0.0,
+            theta_x=0.1,             # Same unstable dynamics
+            theta_a=0.5,             # Same large action effect
+            sigma=0.1, delta=1.0,
+            reward_step_fn=reward_6_1,
+            label='One-Step (Challenging)',
+            use_bellman=False,
+            initial_q=10.0,
+            lip=0.0,
+            scaling=5.0,
+            inherit_flag=False,
+        ),
+    ]
+    
+    goal = 5.0  # Goal is AWAY from start, requires active control
+    
+    for cfg in configs:
+        print(f"\n--- Challenging Delayed Reward: {cfg.label} ---")
+        print(f"    Goal: {goal}, Start: {cfg.starting_state}")
+        print(f"    theta_x: {cfg.theta_x} (unstable), theta_a: {cfg.theta_a} (strong)")
+        
+        start_time = time.time()
+        
+        all_rewards = []
+        all_arms = []
+        
+        for seed in range(cfg.n_seeds):
+            np.random.seed(seed)
+            
+            env = DelayedRewardEnvironment(cfg, goal=goal, reward_type='terminal')
+            agent = AdaptiveModelBasedDiscretization(cfg)
+            
+            episode_rewards = []
+            episode_arms = []
+            
+            for ep in range(cfg.nEps):
+                env.reset()
+                state = env.state.copy()
+                ep_reward = 0.0
+                agent.update_policy(ep)
+                
+                for h in range(cfg.epLen):
+                    action = agent.pick_action(state, h)
+                    reward, new_state, pContinue = env.advance(action)
+                    ep_reward += reward
+                    agent.update_obs(state, action, reward, new_state, h)
+                    
+                    if not pContinue:
+                        break
+                    state = new_state.copy()
+                
+                episode_rewards.append(ep_reward)
+                episode_arms.append(agent.get_num_arms())
+            
+            all_rewards.append(episode_rewards)
+            all_arms.append(episode_arms)
+        
+        total_time = time.time() - start_time
+        
+        reward_matrix = np.array(all_rewards)
+        arm_matrix = np.array(all_arms)
+        
+        results[cfg.label] = {
+            "vpi": reward_matrix.mean(axis=0),
+            "vpi_std": reward_matrix.std(axis=0),
+            "arms": arm_matrix.mean(axis=0),
+            "total_time": total_time,
+            "use_bellman": cfg.use_bellman,
+        }
+        
+        final_mean = results[cfg.label]["vpi"][-100:].mean()
+        final_std = results[cfg.label]["vpi_std"][-100:].mean()
+        print(f"    Final VPI: {final_mean:.3f} ± {final_std:.3f}")
+        print(f"    Time: {total_time:.2f}s")
+    
+    return results
 
 if __name__ == '__main__':
     # ========================================
@@ -1353,7 +1463,6 @@ if __name__ == '__main__':
                            save_path='comparative_study.png')
     print_comparative_summary(comparative_results)
     
-    # Save comparative data
     df_comp_vpi = pd.DataFrame({k: v["vpi"] for k, v in comparative_results.items()})
     df_comp_vpi.to_csv('comparative_vpi.csv', index=False)
     
@@ -1370,34 +1479,67 @@ if __name__ == '__main__':
     tuning_results = run_bellman_tuning_study(n_jobs=-1)
     plot_tuning_study(tuning_results, smooth_window=50, save_path='bellman_tuning.png')
     
-    # Save tuning data
     df_tuning = pd.DataFrame({k: v["vpi"] for k, v in tuning_results.items()})
     df_tuning.to_csv('bellman_tuning_vpi.csv', index=False)
 
     # ========================================
-    # Part 4: Delayed Reward Experiment (Bellman Justification)
+    # Part 4: Delayed Reward Experiment (Easy)
     # ========================================
     print("\n" + "=" * 70)
-    print("PART 4: Delayed Reward Experiment (Bellman Justification)")
+    print("PART 4: Delayed Reward Experiment (Easy - Natural Dynamics)")
     print("=" * 70)
     
     delayed_results = run_delayed_reward_experiment(n_jobs=-1, goal=0.0, reward_type='terminal')
     plot_delayed_reward_comparison(delayed_results, save_path='delayed_reward_comparison.png')
     print_delayed_reward_summary(delayed_results)
     
-    # Save delayed reward data
     df_delayed = pd.DataFrame({k: v["vpi"] for k, v in delayed_results.items()})
     df_delayed.to_csv('delayed_reward_vpi.csv', index=False)
 
     # ========================================
-    # Final Summary
+    # Part 5: Challenging Delayed Reward (Bellman Justification)
     # ========================================
     print("\n" + "=" * 70)
-    print("ALL EXPERIMENTS COMPLETE")
+    print("PART 5: Challenging Delayed Reward (Unstable Dynamics)")
     print("=" * 70)
-    print("\nOutput files:")
-    print("  - vpi_section6_1.png/csv")
-    print("  - comparative_study.png, comparative_vpi.csv")
-    print("  - bellman_tuning.png, bellman_tuning_vpi.csv")
-    print("  - delayed_reward_comparison.png, delayed_reward_vpi.csv")
+    
+    challenging_results = run_challenging_delayed_reward(n_jobs=-1)
+    plot_challenging_delayed_reward(challenging_results, save_path='challenging_delayed_reward.png')
+    print_challenging_summary(challenging_results)
+    
+    df_challenging = pd.DataFrame({k: v["vpi"] for k, v in challenging_results.items()})
+    df_challenging.to_csv('challenging_delayed_reward_vpi.csv', index=False)
+
+    # ========================================
+    # Final Comprehensive Summary
+    # ========================================
+    print_all_experiments_summary(
+        original_results=results,
+        comparative_results=comparative_results,
+        tuning_results=tuning_results,
+        delayed_results=delayed_results,
+        challenging_results=challenging_results
+    )
+
+    # ========================================
+    # List Output Files
+    # ========================================
+    print("\n" + "=" * 70)
+    print("ALL EXPERIMENTS COMPLETE - OUTPUT FILES")
+    print("=" * 70)
+    print("""
+Plots:
+  - vpi_section6_1.png
+  - comparative_study.png
+  - bellman_tuning.png
+  - delayed_reward_comparison.png
+  - challenging_delayed_reward.png
+
+Data (CSV):
+  - vpi_section6_1.csv, arms_section6_1.csv
+  - comparative_vpi.csv, comparative_arms.csv
+  - bellman_tuning_vpi.csv
+  - delayed_reward_vpi.csv
+  - challenging_delayed_reward_vpi.csv
+""")
     print("=" * 70)
