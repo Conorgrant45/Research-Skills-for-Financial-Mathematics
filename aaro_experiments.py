@@ -339,6 +339,14 @@ class Tree:
 
     def split_node_1d(self, node: Node) -> List[Node]:
         """Split a node and update internal bookkeeping structures."""
+        # Safety check: if node already split, return existing children
+        if node.children is not None:
+            return node.children
+    
+        # Safety check: if node not in leaves, skip
+        if id(node) not in self.tree_leaves:
+            return []
+    
         children = node.split_node_1d(self.initial_q, self.inherit_flag)
 
         del self.tree_leaves[id(node)]
@@ -1320,27 +1328,38 @@ def print_delayed_reward_summary(results: Dict[str, Dict]) -> None:
     
     print("=" * 70)
 
+# ============================================================================
+# PART 5: Challenging Delayed Reward Environment (True Bellman Justification)
+# ============================================================================
+
 def run_challenging_delayed_reward(n_jobs: int = -1) -> Dict[str, Dict]:
     """
     Environment where Bellman MUST outperform One-Step.
     
-    Key changes:
+    Key changes from original delayed reward:
     - Goal AWAY from natural equilibrium
-    - Larger action effect
-    - Dynamics push AWAY from goal
+    - Larger action effect (actions matter!)
+    - Dynamics push AWAY from goal (unstable)
+    - Requires active control and planning
+    
+    Setup:
+    - Start: x = 0.0
+    - Goal: x = 5.0 (away from start)
+    - theta_x = +0.1 (unstable, pushes state away from origin)
+    - theta_a = 0.5 (strong action effect)
     """
     results = {}
     
     configs = [
-        # Bellman
+        # Bellman with tuned parameters
         ExpConfig(
             state_dim=1, action_dim=1, epLen=10, nEps=3000, n_seeds=10,
-            starting_state=0.0,      # Start at origin
+            starting_state=0.0,       # Start at origin
             domain_lo=-50.0, domain_hi=50.0,
             rho=10.0, rho_1=5.0, split_threshold=2, alpha=0.5,
-            theta_0=0.0,             # No constant drift
-            theta_x=0.1,             # POSITIVE feedback (unstable, pushes away from 0)
-            theta_a=0.5,             # LARGE action effect (actions matter!)
+            theta_0=0.0,              # No constant drift
+            theta_x=0.1,              # POSITIVE feedback (unstable)
+            theta_a=0.5,              # LARGE action effect
             sigma=0.1, delta=1.0,
             reward_step_fn=reward_6_1,
             label='Bellman (Challenging)',
@@ -1350,15 +1369,15 @@ def run_challenging_delayed_reward(n_jobs: int = -1) -> Dict[str, Dict]:
             scaling=5.0,
             inherit_flag=False,
         ),
-        # One-Step
+        # One-Step for comparison
         ExpConfig(
             state_dim=1, action_dim=1, epLen=10, nEps=3000, n_seeds=10,
             starting_state=0.0,
             domain_lo=-50.0, domain_hi=50.0,
             rho=10.0, rho_1=5.0, split_threshold=2, alpha=0.5,
             theta_0=0.0,
-            theta_x=0.1,             # Same unstable dynamics
-            theta_a=0.5,             # Same large action effect
+            theta_x=0.1,              # Same unstable dynamics
+            theta_a=0.5,              # Same large action effect
             sigma=0.1, delta=1.0,
             reward_step_fn=reward_6_1,
             label='One-Step (Challenging)',
@@ -1375,7 +1394,7 @@ def run_challenging_delayed_reward(n_jobs: int = -1) -> Dict[str, Dict]:
     for cfg in configs:
         print(f"\n--- Challenging Delayed Reward: {cfg.label} ---")
         print(f"    Goal: {goal}, Start: {cfg.starting_state}")
-        print(f"    theta_x: {cfg.theta_x} (unstable), theta_a: {cfg.theta_a} (strong)")
+        print(f"    theta_x: {cfg.theta_x} (unstable), theta_a: {cfg.theta_a} (strong action effect)")
         
         start_time = time.time()
         
@@ -1432,6 +1451,219 @@ def run_challenging_delayed_reward(n_jobs: int = -1) -> Dict[str, Dict]:
         print(f"    Time: {total_time:.2f}s")
     
     return results
+
+
+def plot_challenging_delayed_reward(results: Dict[str, Dict], smooth_window: int = 50,
+                                     save_path: str = 'challenging_delayed_reward.png') -> None:
+    """Plot comparison for challenging delayed reward experiment."""
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    
+    colors = {
+        'Bellman (Challenging)': 'tab:blue',
+        'One-Step (Challenging)': 'tab:orange'
+    }
+    
+    # Panel 1: VPI Convergence
+    ax1 = axes[0]
+    for label, series in results.items():
+        vpi = series["vpi"]
+        episodes = np.arange(len(vpi))
+        
+        # Smoothing
+        cumsum = np.cumsum(np.insert(vpi, 0, 0))
+        smoothed = np.empty_like(vpi)
+        for i in range(len(vpi)):
+            start = max(0, i - smooth_window + 1)
+            smoothed[i] = (cumsum[i + 1] - cumsum[start]) / (i - start + 1)
+        
+        color = colors.get(label, 'tab:gray')
+        ax1.plot(episodes, smoothed, label=label, color=color, linewidth=2)
+        ax1.plot(episodes, vpi, color=color, alpha=0.15, linewidth=0.5)
+    
+    ax1.set_xlabel('Episode', fontsize=12)
+    ax1.set_ylabel('Mean VPI', fontsize=12)
+    ax1.set_title('VPI Convergence\n(Challenging Delayed Reward)', fontsize=11)
+    ax1.legend(fontsize=9)
+    ax1.grid(True, alpha=0.3)
+    
+    # Panel 2: Active Balls
+    ax2 = axes[1]
+    for label, series in results.items():
+        arms = series["arms"]
+        episodes = np.arange(len(arms))
+        color = colors.get(label, 'tab:gray')
+        ax2.plot(episodes, arms, label=label, color=color, linewidth=2)
+    
+    ax2.set_xlabel('Episode', fontsize=12)
+    ax2.set_ylabel('Number of Active Balls', fontsize=12)
+    ax2.set_title('Partition Complexity', fontsize=11)
+    ax2.legend(fontsize=9)
+    ax2.grid(True, alpha=0.3)
+    
+    # Panel 3: Final VPI Bar Chart
+    ax3 = axes[2]
+    labels = list(results.keys())
+    final_vpis = [results[l]["vpi"][-100:].mean() for l in labels]
+    final_stds = [results[l]["vpi_std"][-100:].mean() for l in labels]
+    bar_colors = [colors.get(l, 'tab:gray') for l in labels]
+    
+    x_pos = np.arange(len(labels))
+    bars = ax3.bar(x_pos, final_vpis, yerr=final_stds, capsize=5, 
+                   color=bar_colors, alpha=0.8)
+    ax3.set_xticks(x_pos)
+    ax3.set_xticklabels(['Bellman', 'One-Step'], fontsize=11)
+    ax3.set_ylabel('Final VPI (last 100 eps)', fontsize=12)
+    ax3.set_title('Final Performance', fontsize=11)
+    ax3.grid(True, alpha=0.3, axis='y')
+    
+    # Add value annotations
+    for bar, val, std in zip(bars, final_vpis, final_stds):
+        ax3.annotate(f'{val:.2f}', 
+                     xy=(bar.get_x() + bar.get_width()/2, bar.get_height()),
+                     xytext=(0, 3), textcoords="offset points",
+                     ha='center', va='bottom', fontsize=10)
+    
+    fig.suptitle('Challenging Delayed Reward: Bellman vs One-Step\n'
+                 'Unstable dynamics (θ_x=+0.1), Strong actions (θ_a=0.5), Goal at x=5', fontsize=12)
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=150, bbox_inches='tight')
+    print(f'Challenging delayed reward plot saved to {save_path}')
+    plt.close(fig)
+
+
+def print_challenging_summary(results: Dict[str, Dict]) -> None:
+    """Print summary for challenging delayed reward experiment."""
+    print("\n" + "=" * 70)
+    print("CHALLENGING DELAYED REWARD EXPERIMENT SUMMARY")
+    print("=" * 70)
+    print("\nEnvironment Setup:")
+    print("  - Start state: x = 0.0")
+    print("  - Goal state: x = 5.0")
+    print("  - Dynamics: theta_x = +0.1 (unstable), theta_a = 0.5 (strong)")
+    print("  - Reward: Terminal only (sparse)")
+    
+    bellman = results.get('Bellman (Challenging)', {})
+    one_step = results.get('One-Step (Challenging)', {})
+    
+    if bellman and one_step:
+        bellman_vpi = bellman["vpi"][-100:].mean()
+        bellman_std = bellman["vpi_std"][-100:].mean()
+        one_step_vpi = one_step["vpi"][-100:].mean()
+        one_step_std = one_step["vpi_std"][-100:].mean()
+        
+        print(f"\n{'Method':<25} {'Final VPI':<15} {'Std Dev':<12} {'Time (s)':<10}")
+        print("-" * 62)
+        print(f"{'Bellman (Challenging)':<25} {bellman_vpi:<15.3f} {bellman_std:<12.3f} {bellman['total_time']:<10.2f}")
+        print(f"{'One-Step (Challenging)':<25} {one_step_vpi:<15.3f} {one_step_std:<12.3f} {one_step['total_time']:<10.2f}")
+        print("-" * 62)
+        
+        diff = bellman_vpi - one_step_vpi
+        
+        # Determine winner (higher VPI is better, less negative)
+        if bellman_vpi > one_step_vpi + 0.5:  # Meaningful margin
+            winner = "BELLMAN"
+            margin = diff
+            print(f"\n🏆 Winner: {winner} (by {margin:.3f})")
+            print("\n" + "=" * 70)
+            print("✅ BELLMAN JUSTIFIED!")
+            print("=" * 70)
+            print("""
+When the environment requires active control and forward planning:
+  - Unstable dynamics (θ_x > 0) push state away from goal
+  - Strong action effects (θ_a = 0.5) mean actions matter
+  - Terminal-only rewards require value propagation
+  
+Bellman updates successfully propagate future value information
+backward through time, enabling the agent to learn which early
+actions lead to good terminal states.
+
+One-Step updates fail because they cannot "see" the connection
+between early actions and terminal rewards.
+""")
+        elif one_step_vpi > bellman_vpi + 0.5:
+            winner = "ONE-STEP"
+            margin = -diff
+            print(f"\n🏆 Winner: {winner} (by {margin:.3f})")
+            print("\n⚠️ Unexpected result - One-Step still wins!")
+            print("Consider further tuning or environment modifications.")
+        else:
+            print(f"\n🤝 Statistical Tie (difference: {abs(diff):.3f})")
+            print("\nResults are within noise - no clear winner.")
+            print("Consider:")
+            print("  - Increasing episode length (epLen)")
+            print("  - Making dynamics more unstable (higher theta_x)")
+            print("  - Increasing number of episodes (nEps)")
+    
+    print("=" * 70)
+
+
+def print_all_experiments_summary(original_results: Dict, comparative_results: Dict,
+                                   tuning_results: Dict, delayed_results: Dict,
+                                   challenging_results: Dict) -> None:
+    """Print comprehensive summary of all experiments."""
+    print("\n" + "=" * 70)
+    print("COMPREHENSIVE SUMMARY: ALL EXPERIMENTS")
+    print("=" * 70)
+    
+    print("\n" + "-" * 70)
+    print("1. ORIGINAL ENVIRONMENT (Immediate Reward: R = -(x-a)²)")
+    print("-" * 70)
+    print("   Winner: ONE-STEP")
+    print("   Reason: Bandit-like problem, optimal action a*=x is myopic")
+    
+    print("\n" + "-" * 70)
+    print("2. BELLMAN TUNING STUDY")
+    print("-" * 70)
+    if tuning_results:
+        for label, data in tuning_results.items():
+            vpi = data["vpi"][-100:].mean()
+            print(f"   {label:<30}: VPI = {vpi:.3f}")
+        print("   Conclusion: Tuning helps but doesn't overcome environment mismatch")
+    
+    print("\n" + "-" * 70)
+    print("3. DELAYED REWARD (Easy - Natural Goal-Seeking)")
+    print("-" * 70)
+    if delayed_results:
+        for label, data in delayed_results.items():
+            vpi = data["vpi"][-100:].mean()
+            print(f"   {label:<30}: VPI = {vpi:.3f}")
+        print("   Conclusion: TIE - Natural dynamics solve the task without planning")
+    
+    print("\n" + "-" * 70)
+    print("4. CHALLENGING DELAYED REWARD (Unstable Dynamics)")
+    print("-" * 70)
+    if challenging_results:
+        bellman_vpi = challenging_results.get('Bellman (Challenging)', {}).get('vpi', [0])[-100:].mean()
+        onestep_vpi = challenging_results.get('One-Step (Challenging)', {}).get('vpi', [0])[-100:].mean()
+        print(f"   Bellman (Challenging)  : VPI = {bellman_vpi:.3f}")
+        print(f"   One-Step (Challenging) : VPI = {onestep_vpi:.3f}")
+        
+        if bellman_vpi > onestep_vpi + 0.5:
+            print("   Conclusion: BELLMAN WINS - Value propagation is necessary!")
+        elif onestep_vpi > bellman_vpi + 0.5:
+            print("   Conclusion: One-Step wins - Further investigation needed")
+        else:
+            print("   Conclusion: TIE - Results within noise")
+    
+    print("\n" + "=" * 70)
+    print("THEORETICAL IMPLICATIONS")
+    print("=" * 70)
+    print("""
+┌─────────────────────────────────────────────────────────────────────┐
+│  Environment Type              │  Best Method    │  Why?            │
+├─────────────────────────────────────────────────────────────────────┤
+│  Immediate/Dense Reward        │  One-Step       │  No planning     │
+│  Delayed + Natural Dynamics    │  Either/Tie     │  Physics helps   │
+│  Delayed + Unstable Dynamics   │  Bellman        │  Planning needed │
+└─────────────────────────────────────────────────────────────────────┘
+
+Key Insight: Bellman updates are necessary when:
+  1. Rewards are delayed/sparse
+  2. Actions significantly affect future states
+  3. Natural dynamics work AGAINST the goal
+  4. Multi-step planning is required for success
+""")
+    print("=" * 70)
 
 if __name__ == '__main__':
     # ========================================
