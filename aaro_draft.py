@@ -1,19 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Research project - Adaptive Model-Based Discretization
-Authors: Kyle McGillivray, Conor, Aaro
-
-Implements Section 6.1 of Jin, Xu, Yang (2025): "A one-dimensional example"
-
-Paper setup (Section 6.1):
-  - State space: S = R, action space: [0, 10]
-  - Dynamics:  mu_h(x,a) = 0.05 - 0.1x + 0.01a
-               sigma_h(x,a) = 0.1 (constant)
-               X_1 = 4
-  - Reward:    R_h(x,a) ~ N((x-a)^2, 0.01) for h in [H-1]
-  - H = 10, K = 2000, rho = 10
-"""
 import numpy as np
 import math
 import pandas as pd
@@ -21,6 +5,7 @@ import matplotlib.pyplot as plt
 from dataclasses import dataclass, field
 from typing import Callable, Optional, List, Dict, Tuple
 from joblib import Parallel, delayed
+import time
 
 
 def reward_6_1(state: np.ndarray, action: np.ndarray) -> float:
@@ -55,6 +40,8 @@ class ExpConfig:
     delta: float = 1.0
     reward_step_fn: Callable = field(default_factory=lambda: reward_6_1)
     label: str = 'Section 6.1'
+    use_bellman: bool = True  # True = Full Bellman, False = One-Step
+    inherit_flag: bool = False  # Whether to inherit estimates on split
     _sigma_sqrt_delta: float = field(init=False, repr=False)
 
     def __post_init__(self):
@@ -149,7 +136,7 @@ class LinearDiffEnvironment(Environment):
 
 class Experiment:
     """Runs episodes and collects cumulative rewards for one agent-environment pair."""
-    __slots__ = ('env', 'agent', 'nEps', 'epLen', 'data', '_seed')
+    __slots__ = ('env', 'agent', 'nEps', 'epLen', 'data', 'arms', '_seed')
 
     def __init__(self, env: Environment, agent: Agent, cfg: ExpConfig, seed: int):
         self.env = env
@@ -157,10 +144,11 @@ class Experiment:
         self.nEps = cfg.nEps
         self.epLen = env.get_epLen()
         self.data = np.zeros(self.nEps, dtype=np.float64)
+        self.arms = np.zeros(self.nEps, dtype=np.float64)
         self._seed = seed
 
-    def run(self) -> np.ndarray:
-        """Execute all episodes and return array of per-episode rewards."""
+    def run(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Execute all episodes and return arrays of per-episode rewards and active balls."""
         np.random.seed(self._seed)
 
         env_reset = self.env.reset
@@ -168,9 +156,11 @@ class Experiment:
         agent_update_policy = self.agent.update_policy
         agent_pick_action = self.agent.pick_action
         agent_update_obs = self.agent.update_obs
+        agent_get_num_arms = self.agent.get_num_arms
         env_state = self.env
         epLen = self.epLen
         data = self.data
+        arms = self.arms
 
         for ep in range(self.nEps):
             env_reset()
@@ -190,8 +180,9 @@ class Experiment:
                 state[0] = new_state[0]
 
             data[ep] = epReward
+            arms[ep] = agent_get_num_arms()
 
-        return data
+        return data, arms
 
 
 class Node:
@@ -236,7 +227,7 @@ class Node:
         """Check if state lies within this node's L-inf ball."""
         return abs(state[0] - self._state_center) <= self.radius
 
-    def split_node_1d(self, initial_q: float) -> List['Node']:
+    def split_node_1d(self, initial_q: float, inherit_flag: bool = False) -> List['Node']:
         """Split node into 4 children by halving state and action radii."""
         half_r = self.radius * 0.5
         half_ar = self.action_radius * 0.5
@@ -244,7 +235,7 @@ class Node:
         ac = self._action_center
 
         children = []
-        inherit = self.num_visits > 1
+        inherit = inherit_flag and self.num_visits > 1
 
         if inherit:
             qVal_init = self.qVal
@@ -293,11 +284,12 @@ class Tree:
     """
     __slots__ = ('cfg', 'initial_q', 'head', 'tree_leaves',
                  'state_leaves', 'vEst', '_state_to_idx', 'min_vEst',
-                 '_lookup_cache', '_vEst_dirty')
+                 '_lookup_cache', '_vEst_dirty', 'inherit_flag')
 
     def __init__(self, cfg: ExpConfig):
         self.cfg = cfg
         self.initial_q = cfg.initial_q
+        self.inherit_flag = cfg.inherit_flag
 
         start_state = np.array([0.0], dtype=np.float64)
         start_action = np.array([5.0], dtype=np.float64)
@@ -347,7 +339,7 @@ class Tree:
 
     def split_node_1d(self, node: Node) -> List[Node]:
         """Split a node and update internal bookkeeping structures."""
-        children = node.split_node_1d(self.initial_q)
+        children = node.split_node_1d(self.initial_q, self.inherit_flag)
 
         del self.tree_leaves[id(node)]
         for child in children:
@@ -422,9 +414,14 @@ class AdaptiveModelBasedDiscretization(Agent):
     Maintains a separate partition tree for each timestep and performs
     Bellman updates with UCB exploration bonuses. Nodes split when
     sufficiently visited to refine the state-action discretization.
+    
+    Parameters:
+        use_bellman: If True, uses full Bellman updates with value propagation.
+                     If False, uses one-step updates (reward only).
     """
     __slots__ = ('cfg', 'epLen', 'scaling', 'alpha', 'split_threshold', 'lip',
-                 'initial_q', 'state_dim', 'tree_list', '_split_thresholds')
+                 'initial_q', 'state_dim', 'tree_list', '_split_thresholds',
+                 'use_bellman', 'inherit_flag')
 
     def __init__(self, cfg: ExpConfig):
         self.cfg = cfg
@@ -435,6 +432,8 @@ class AdaptiveModelBasedDiscretization(Agent):
         self.lip = cfg.lip
         self.initial_q = cfg.initial_q
         self.state_dim = cfg.state_dim
+        self.use_bellman = cfg.use_bellman
+        self.inherit_flag = cfg.inherit_flag
 
         self._split_thresholds = [
             2 ** (cfg.split_threshold * i) for i in range(21)
@@ -478,11 +477,16 @@ class AdaptiveModelBasedDiscretization(Agent):
         if is_terminal:
             q_new = active_node.rEst + ucb
         else:
-            next_tree = self.tree_list[timestep + 1]
-            mu_sq = active_node.muEst[0] ** 2
-            sigma_sq = active_node.sigmaEst[0]
-            vEst_next = next_tree.min_vEst + self.lip * (1.0 + mu_sq + sigma_sq)
-            q_new = active_node.rEst + vEst_next + ucb
+            if self.use_bellman:
+                # Full Bellman update: use value function from next timestep
+                next_tree = self.tree_list[timestep + 1]
+                mu_sq = active_node.muEst[0] ** 2
+                sigma_sq = active_node.sigmaEst[0]
+                vEst_next = next_tree.min_vEst + self.lip * (1.0 + mu_sq + sigma_sq)
+                q_new = active_node.rEst + vEst_next + ucb
+            else:
+                # One-step update: only use immediate reward (no value propagation)
+                q_new = active_node.rEst + ucb
 
         active_node.qVal = min(active_node.qVal, self.initial_q, q_new)
         tree.update_vEst()
@@ -514,41 +518,165 @@ class AdaptiveModelBasedDiscretization(Agent):
         return np.array([np.random.uniform(lo, hi)], dtype=np.float64)
 
 
-def run_one_seed(seed: int, cfg: ExpConfig) -> np.ndarray:
+def run_one_seed(seed: int, cfg: ExpConfig) -> Tuple[np.ndarray, np.ndarray]:
     """Execute a single experiment run with the given random seed."""
     env = LinearDiffEnvironment(cfg)
     agent = AdaptiveModelBasedDiscretization(cfg)
     exp = Experiment(env, agent, cfg, seed)
-    return exp.run()
+    rewards, arms = exp.run()
+    return rewards, arms
 
 
-def run_experiment(configs: List[ExpConfig], n_jobs: int = -1) -> Dict[str, np.ndarray]:
+def run_one_seed_timed(seed: int, cfg: ExpConfig) -> Tuple[np.ndarray, np.ndarray, float]:
+    """Execute a single experiment run with timing."""
+    start_time = time.time()
+    env = LinearDiffEnvironment(cfg)
+    agent = AdaptiveModelBasedDiscretization(cfg)
+    exp = Experiment(env, agent, cfg, seed)
+    rewards, arms = exp.run()
+    duration = time.time() - start_time
+    return rewards, arms, duration
+
+
+def run_experiment(configs: List[ExpConfig], n_jobs: int = -1) -> Dict[str, Dict[str, np.ndarray]]:
     """Run experiments for all configurations, parallelizing across seeds."""
     results = {}
 
     for cfg in configs:
         print(f"\n--- Running: {cfg.label} ---")
 
-        seed_rewards = Parallel(n_jobs=n_jobs, prefer="threads")(
+        seed_runs = Parallel(n_jobs=n_jobs, prefer="threads")(
             delayed(run_one_seed)(seed, cfg) for seed in range(cfg.n_seeds)
         )
 
-        matrix = np.vstack(seed_rewards)
-        results[cfg.label] = matrix.mean(axis=0)
+        reward_matrix = np.vstack([r for r, a in seed_runs])
+        arm_matrix = np.vstack([a for r, a in seed_runs])
 
-        final_mean = results[cfg.label][-100:].mean()
+        results[cfg.label] = {
+            "vpi": reward_matrix.mean(axis=0),
+            "vpi_std": reward_matrix.std(axis=0),
+            "arms": arm_matrix.mean(axis=0)
+        }
+
+        final_mean = results[cfg.label]["vpi"][-100:].mean()
         print(f"    Done. Final mean VPI: {final_mean:.3f}")
 
     return results
 
 
-def plot_vpi(results: Dict[str, np.ndarray], smooth_window: int = 50,
+def run_comparative_study(n_jobs: int = -1) -> Dict[str, Dict]:
+    """
+    Run comparative study between Full Bellman and One-Step update strategies.
+    
+    Returns a dictionary with results for both strategies including:
+    - VPI (value per iteration)
+    - Arms (number of active balls)
+    - Timing information
+    """
+    results = {}
+    
+    # Configuration for Full Bellman (High precision, Higher cost)
+    cfg_bellman = ExpConfig(
+        state_dim=1,
+        action_dim=1,
+        epLen=10,
+        nEps=2000,
+        n_seeds=10,
+        starting_state=4.0,
+        domain_lo=-50.0,
+        domain_hi=50.0,
+        initial_q=1837.1,
+        rho=10.0,
+        rho_1=5.0,
+        lip=1.0,
+        split_threshold=2,
+        scaling=5.0,
+        alpha=0.5,
+        theta_0=0.05,
+        theta_x=-0.1,
+        theta_a=0.01,
+        sigma=0.1,
+        delta=1.0,
+        reward_step_fn=reward_6_1,
+        label='Full Bellman Update',
+        use_bellman=True,
+        inherit_flag=False,
+    )
+    
+    # Configuration for One-Step (Lower precision, Lower cost)
+    cfg_one_step = ExpConfig(
+        state_dim=1,
+        action_dim=1,
+        epLen=10,
+        nEps=2000,
+        n_seeds=10,
+        starting_state=4.0,
+        domain_lo=-50.0,
+        domain_hi=50.0,
+        initial_q=1837.1,
+        rho=10.0,
+        rho_1=5.0,
+        lip=1.0,
+        split_threshold=2,
+        scaling=5.0,
+        alpha=0.5,
+        theta_0=0.05,
+        theta_x=-0.1,
+        theta_a=0.01,
+        sigma=0.1,
+        delta=1.0,
+        reward_step_fn=reward_6_1,
+        label='One-Step Update',
+        use_bellman=False,
+        inherit_flag=False,
+    )
+    
+    configs = [cfg_bellman, cfg_one_step]
+    
+    for cfg in configs:
+        print(f"\n--- Running Comparative Study: {cfg.label} ---")
+        print(f"    use_bellman={cfg.use_bellman}, inherit_flag={cfg.inherit_flag}")
+        
+        start_time = time.time()
+        
+        # Run experiments with timing
+        seed_runs = Parallel(n_jobs=n_jobs, prefer="threads")(
+            delayed(run_one_seed_timed)(seed, cfg) for seed in range(cfg.n_seeds)
+        )
+        
+        total_time = time.time() - start_time
+        
+        reward_matrix = np.vstack([r for r, a, t in seed_runs])
+        arm_matrix = np.vstack([a for r, a, t in seed_runs])
+        seed_times = np.array([t for r, a, t in seed_runs])
+        
+        results[cfg.label] = {
+            "vpi": reward_matrix.mean(axis=0),
+            "vpi_std": reward_matrix.std(axis=0),
+            "arms": arm_matrix.mean(axis=0),
+            "arms_std": arm_matrix.std(axis=0),
+            "total_time": total_time,
+            "mean_seed_time": seed_times.mean(),
+            "std_seed_time": seed_times.std(),
+            "use_bellman": cfg.use_bellman,
+        }
+        
+        final_mean = results[cfg.label]["vpi"][-100:].mean()
+        final_std = results[cfg.label]["vpi_std"][-100:].mean()
+        print(f"    Done. Final mean VPI: {final_mean:.3f} ± {final_std:.3f}")
+        print(f"    Total time: {total_time:.2f}s, Mean per seed: {seed_times.mean():.2f}s")
+    
+    return results
+
+
+def plot_vpi(results: Dict[str, Dict[str, np.ndarray]], smooth_window: int = 50,
              save_path: str = 'vpi_section6_1.png') -> None:
     """Plot VPI convergence curves with smoothing."""
     fig, ax = plt.subplots(figsize=(10, 6))
     colours = plt.cm.tab10(np.linspace(0, 0.8, len(results)))
 
-    for (label, vpi), colour in zip(results.items(), colours):
+    for (label, series), colour in zip(results.items(), colours):
+        vpi = series["vpi"]
         episodes = np.arange(len(vpi))
 
         cumsum = np.cumsum(np.insert(vpi, 0, 0))
@@ -571,6 +699,129 @@ def plot_vpi(results: Dict[str, np.ndarray], smooth_window: int = 50,
     fig.savefig(save_path, dpi=150, bbox_inches='tight')
     print(f'Plot saved to {save_path}')
     plt.close(fig)
+
+
+def plot_comparative_study(results: Dict[str, Dict], smooth_window: int = 50,
+                           save_path: str = 'comparative_study.png') -> None:
+    """Plot comparative study results: VPI and Arms side by side."""
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+    colours = {'Full Bellman Update': 'tab:blue', 'One-Step Update': 'tab:orange'}
+    
+    # Plot 1: VPI Convergence
+    ax1 = axes[0]
+    for label, series in results.items():
+        vpi = series["vpi"]
+        episodes = np.arange(len(vpi))
+        
+        cumsum = np.cumsum(np.insert(vpi, 0, 0))
+        smoothed = np.empty_like(vpi)
+        for i in range(len(vpi)):
+            start = max(0, i - smooth_window + 1)
+            smoothed[i] = (cumsum[i + 1] - cumsum[start]) / (i - start + 1)
+        
+        color = colours.get(label, 'tab:gray')
+        ax1.plot(episodes, smoothed, label=label, color=color, linewidth=2)
+        ax1.plot(episodes, vpi, color=color, alpha=0.12, linewidth=0.7)
+    
+    ax1.set_xlabel('Episode (K)', fontsize=12)
+    ax1.set_ylabel('Mean VPI', fontsize=12)
+    ax1.set_title('VPI Convergence Comparison', fontsize=12)
+    ax1.legend(fontsize=10)
+    ax1.grid(True, alpha=0.3)
+    
+    # Plot 2: Number of Active Balls
+    ax2 = axes[1]
+    for label, series in results.items():
+        arms = series["arms"]
+        episodes = np.arange(len(arms))
+        color = colours.get(label, 'tab:gray')
+        ax2.plot(episodes, arms, label=label, color=color, linewidth=2)
+    
+    ax2.set_xlabel('Episode (K)', fontsize=12)
+    ax2.set_ylabel('Number of Active Balls', fontsize=12)
+    ax2.set_title('Partition Complexity', fontsize=12)
+    ax2.legend(fontsize=10)
+    ax2.grid(True, alpha=0.3)
+    
+    # Plot 3: Timing Comparison (Bar Chart)
+    ax3 = axes[2]
+    labels = list(results.keys())
+    times = [results[l]["mean_seed_time"] for l in labels]
+    time_stds = [results[l]["std_seed_time"] for l in labels]
+    bar_colors = [colours.get(l, 'tab:gray') for l in labels]
+    
+    bars = ax3.bar(labels, times, yerr=time_stds, capsize=5, color=bar_colors, alpha=0.8)
+    ax3.set_ylabel('Time per Seed (seconds)', fontsize=12)
+    ax3.set_title('Computational Cost', fontsize=12)
+    ax3.grid(True, alpha=0.3, axis='y')
+    
+    # Add value labels on bars
+    for bar, time_val in zip(bars, times):
+        height = bar.get_height()
+        ax3.annotate(f'{time_val:.2f}s',
+                     xy=(bar.get_x() + bar.get_width() / 2, height),
+                     xytext=(0, 3), textcoords="offset points",
+                     ha='center', va='bottom', fontsize=10)
+    
+    fig.suptitle('Bellman vs One-Step Update: Comparative Study\n'
+                 'Linear Diffusion Environment (Section 6.1)', fontsize=14, y=1.02)
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=150, bbox_inches='tight')
+    print(f'Comparative study plot saved to {save_path}')
+    plt.close(fig)
+
+
+def print_comparative_summary(results: Dict[str, Dict]) -> None:
+    """Print a summary table of the comparative study results."""
+    print("\n" + "=" * 70)
+    print("COMPARATIVE STUDY SUMMARY: Full Bellman vs One-Step Update")
+    print("=" * 70)
+    
+    headers = ["Metric", "Full Bellman", "One-Step", "Difference"]
+    print(f"\n{headers[0]:<30} {headers[1]:<15} {headers[2]:<15} {headers[3]:<15}")
+    print("-" * 70)
+    
+    bellman = results.get('Full Bellman Update', {})
+    one_step = results.get('One-Step Update', {})
+    
+    if bellman and one_step:
+        # Final VPI (last 100 episodes)
+        bellman_vpi = bellman["vpi"][-100:].mean()
+        one_step_vpi = one_step["vpi"][-100:].mean()
+        diff_vpi = bellman_vpi - one_step_vpi
+        print(f"{'Final VPI (last 100 eps)':<30} {bellman_vpi:<15.3f} {one_step_vpi:<15.3f} {diff_vpi:+.3f}")
+        
+        # Final Arms
+        bellman_arms = bellman["arms"][-1]
+        one_step_arms = one_step["arms"][-1]
+        diff_arms = bellman_arms - one_step_arms
+        print(f"{'Final Active Balls':<30} {bellman_arms:<15.0f} {one_step_arms:<15.0f} {diff_arms:+.0f}")
+        
+        # Timing
+        bellman_time = bellman["mean_seed_time"]
+        one_step_time = one_step["mean_seed_time"]
+        speedup = bellman_time / one_step_time if one_step_time > 0 else float('inf')
+        print(f"{'Mean Time per Seed (s)':<30} {bellman_time:<15.2f} {one_step_time:<15.2f} {speedup:.2f}x")
+        
+        # Convergence speed (episode to reach 90% of final performance)
+        def get_convergence_episode(vpi, threshold_pct=0.9):
+            final_val = vpi[-100:].mean()
+            threshold = final_val * threshold_pct
+            for i, v in enumerate(vpi):
+                if v >= threshold:
+                    return i
+            return len(vpi)
+        
+        bellman_conv = get_convergence_episode(bellman["vpi"])
+        one_step_conv = get_convergence_episode(one_step["vpi"])
+        diff_conv = bellman_conv - one_step_conv
+        print(f"{'Episodes to 90% Final VPI':<30} {bellman_conv:<15d} {one_step_conv:<15d} {diff_conv:+d}")
+    
+    print("=" * 70)
+    print("\nInterpretation:")
+    print("- Full Bellman: Uses complete value function propagation (higher precision)")
+    print("- One-Step: Uses only immediate rewards (lower computational cost)")
+    print("=" * 70 + "\n")
 
 
 CFG_6_1 = ExpConfig(
@@ -596,14 +847,70 @@ CFG_6_1 = ExpConfig(
     delta=1.0,
     reward_step_fn=reward_6_1,
     label='Section 6.1 — Linear diffusion',
+    use_bellman=True,
+    inherit_flag=False,
 )
 
 
 if __name__ == '__main__':
+    # ========================================
+    # Part 1: Original Section 6.1 Experiment
+    # ========================================
+    print("\n" + "=" * 70)
+    print("PART 1: Original Section 6.1 Experiment")
+    print("=" * 70)
+    
     results = run_experiment([CFG_6_1], n_jobs=-1)
     plot_vpi(results, smooth_window=50, save_path='vpi_section6_1.png')
 
-    df = pd.DataFrame(results)
-    df.index.name = 'episode'
-    df.to_csv('vpi_section6_1.csv', index=False)
-    print('Data saved to vpi_section6_1.csv')
+    df_vpi = pd.DataFrame({k: v["vpi"] for k, v in results.items()})
+    df_vpi.index.name = 'episode'
+    df_vpi.to_csv('vpi_section6_1.csv', index=False)
+
+    df_arms = pd.DataFrame({k: v["arms"] for k, v in results.items()})
+    df_arms.index.name = 'episode'
+    df_arms.to_csv('arms_section6_1.csv', index=False)
+
+    print('Data saved to vpi_section6_1.csv and arms_section6_1.csv')
+
+    # ========================================
+    # Part 2: Comparative Study (Bellman vs One-Step)
+    # ========================================
+    print("\n" + "=" * 70)
+    print("PART 2: Comparative Study - Full Bellman vs One-Step Update")
+    print("=" * 70)
+    
+    comparative_results = run_comparative_study(n_jobs=-1)
+    
+    # Plot comparative results
+    plot_comparative_study(comparative_results, smooth_window=50, 
+                           save_path='comparative_study.png')
+    
+    # Print summary
+    print_comparative_summary(comparative_results)
+    
+    # Save comparative study data
+    df_comp_vpi = pd.DataFrame({k: v["vpi"] for k, v in comparative_results.items()})
+    df_comp_vpi.index.name = 'episode'
+    df_comp_vpi.to_csv('comparative_vpi.csv', index=False)
+    
+    df_comp_arms = pd.DataFrame({k: v["arms"] for k, v in comparative_results.items()})
+    df_comp_arms.index.name = 'episode'
+    df_comp_arms.to_csv('comparative_arms.csv', index=False)
+    
+    # Save timing summary
+    timing_summary = pd.DataFrame({
+        'Method': list(comparative_results.keys()),
+        'Total Time (s)': [v["total_time"] for v in comparative_results.values()],
+        'Mean Time per Seed (s)': [v["mean_seed_time"] for v in comparative_results.values()],
+        'Std Time per Seed (s)': [v["std_seed_time"] for v in comparative_results.values()],
+        'Final VPI': [v["vpi"][-100:].mean() for v in comparative_results.values()],
+        'Final Arms': [v["arms"][-1] for v in comparative_results.values()],
+    })
+    timing_summary.to_csv('comparative_timing.csv', index=False)
+    
+    print('Comparative study data saved to:')
+    print('  - comparative_vpi.csv')
+    print('  - comparative_arms.csv')
+    print('  - comparative_timing.csv')
+    print('  - comparative_study.png')
