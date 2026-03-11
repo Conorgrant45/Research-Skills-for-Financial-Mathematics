@@ -1,73 +1,90 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Mon Mar  9 11:18:56 2026
+
+@author: kylemcgillivray
+
+Research project
+with Conor and Aaro
+"""
 import numpy as np
-import math
+import math  # CHANGE 1: Use math.sqrt for scalar operations (faster than np.sqrt)
 import pandas as pd
 import matplotlib.pyplot as plt
-from dataclasses import dataclass, field
-from typing import Callable, Optional, List, Dict, Tuple
+import itertools
 from joblib import Parallel, delayed
-import time
+# CHANGE 2: Removed unused imports: gymnasium, matplotlib.patches, mpl, os.path,
+# shutil.copyfile, pickle, time - reduces import overhead
+
+""""
+Notes: One-step update that doesn't use the full bellman update and go a planned path is so much better
+It basically takes the average ...
+
+To fix the out-of-bounds code: to advance after new_state, add: new_state = np.clip(new_state, -rho, rho)
+and to tree in get_active_ball:
+                            safe_state = np.clip(state, 
+                            self.head.state_val - self.head.radius, 
+                            self.head.state_val + self.head.radius)
+        
+                            active_node, qVal = self.get_active_ball_recursion(safe_state, self.head)
+                            return active_node, qVal
 
 
-def reward_6_1(state: np.ndarray, action: np.ndarray) -> float:
-    """Compute noisy quadratic reward: R ~ N(-(x-a)^2, 0.01)."""
-    x, a = state[0], action[0]
-    diff = x - a
-    return -(diff * diff) + np.random.normal(0.0, 0.01)
+"""
 
 
-@dataclass
-class ExpConfig:
-    """Experiment configuration storing all hyperparameters."""
-    state_dim: int = 1
-    action_dim: int = 1
-    epLen: int = 10
-    nEps: int = 2000
-    n_seeds: int = 10
-    starting_state: float = 4.0
-    domain_lo: float = -50.0
-    domain_hi: float = 50.0
-    initial_q: float = 1837.1
-    rho: float = 10.0
-    rho_1: float = 5.0
-    lip: float = 1.0
-    split_threshold: int = 2
-    scaling: float = 5.0
-    alpha: float = 0.5
-    theta_0: float = 0.05
-    theta_x: float = -0.1
-    theta_a: float = 0.01
-    sigma: float = 0.1
-    delta: float = 1.0
-    reward_step_fn: Callable = field(default_factory=lambda: reward_6_1)
-    label: str = 'Section 6.1'
-    use_bellman: bool = True  # True = Full Bellman, False = One-Step
-    inherit_flag: bool = False  # Whether to inherit estimates on split
-    _sigma_sqrt_delta: float = field(init=False, repr=False)
+# --- Core simulation parameters ---
+epLen = 30
+nEps = 2000
+numIters = 1
+starting_state = 2
+theta = 0.05
+kappa = 0.1
+sigma = 0.2
+Delta = 1/52
+action_dim = 2
 
-    def __post_init__(self):
-        self._sigma_sqrt_delta = self.sigma * math.sqrt(self.delta)
+# --- Algorithm hyperparameters ---
+initial_q = 50
+rho = 50
+rho_1 = 0.5
+lip = 1
+split_threshold = 2
+scaling = 0.01
+
+# Precompute constants used repeatedly in hot loops
+_SQRT_DELTA = math.sqrt(Delta) 
+_INV_ACTION_DIM = 1.0 / action_dim
+# Precompute the action offset array once at module level (was recomputed every split)
+_ACTION_OFFSETS = np.array(list(itertools.product([-1, 1], repeat=action_dim)), dtype=np.float64)
+_STATE_OFFSETS = np.array([-1, 1], dtype=np.float64)
+_NUM_ACTION_OFFSETS = 2 ** action_dim
 
 
-class Agent:
-    """Abstract base class for reinforcement learning agents."""
-    __slots__ = ()
+class Agent(object):
+    """Abstract base class for a reinforcement learning agent."""
 
-    def update_obs(self, obs, action, reward, newObs, timestep):
+    def __init__(self):
         pass
 
-    def update_policy(self, k):
+    def update_obs(self, obs, action, reward, newObs):
         pass
 
-    def pick_action(self, obs, timestep):
+    def update_policy(self, h):
+        pass
+
+    def pick_action(self, obs):
         pass
 
     def get_num_arms(self):
         pass
 
+class Environment(object):
+    """Abstract base class for a reinforcement learning environment."""
 
-class Environment:
-    """Abstract base class for RL environments."""
-    __slots__ = ()
+    def __init__(self):
+        pass
 
     def reset(self):
         pass
@@ -75,135 +92,155 @@ class Environment:
     def advance(self, action):
         return 0, 0, 0
 
-    def get_epLen(self):
-        return 0
-
-
-class LinearDiffEnvironment(Environment):
-    """
-    Section 6.1 environment with linear diffusion dynamics.
-
-    Dynamics: X_{h+1} = X_h + (theta_0 + theta_x*X_h + theta_a*a_h)*Delta
-                            + sigma*sqrt(Delta)*Z_h
-    States are projected onto [domain_lo, domain_hi] to maintain compactness.
-    """
-    __slots__ = ('cfg', 'epLen', '_start', 'state', 'timestep',
-                 'projection_count', '_sigma_sqrt_delta', '_domain_lo', '_domain_hi')
-
-    def __init__(self, cfg: ExpConfig):
-        self.cfg = cfg
-        self.epLen = cfg.epLen
-        self._start = np.array([cfg.starting_state], dtype=np.float64)
-        self.state = self._start.copy()
+class ContinuousAIGym(Environment):
+    """A wrapper class to adapt an OpenAI Gym environment for use with this framework."""
+    def __init__(self, env, epLen):
+        self.env = env
+        self.epLen = epLen
         self.timestep = 0
-        self.projection_count = 0
-        self._sigma_sqrt_delta = cfg._sigma_sqrt_delta
-        self._domain_lo = cfg.domain_lo
-        self._domain_hi = cfg.domain_hi
+        self.state = self.env.reset()
 
-    def get_epLen(self) -> int:
+    def get_epLen(self):
         return self.epLen
 
-    def reset(self) -> None:
+    def reset(self):
         self.timestep = 0
-        self.state = self._start.copy()
+        self.state = self.env.reset()
 
-    def advance(self, action: np.ndarray) -> Tuple[float, np.ndarray, int]:
-        """Execute one environment step, returning (reward, new_state, continue_flag)."""
-        cfg = self.cfg
-        x, a = self.state[0], action[0]
+    def advance(self, action):
+        newState, reward, terminal, info = self.env.step(action)
+        if self.timestep == self.epLen or terminal:
+            pContinue = 0
+            self.reset()
+        else:
+            pContinue = 1
+        return reward, newState, pContinue
 
-        drift = cfg.theta_0 + cfg.theta_x * x + cfg.theta_a * a
-        noise = np.random.randn()
-        new_x = x + drift * cfg.delta + self._sigma_sqrt_delta * noise
+class AdaDiffEnvironment(Environment):
+    """A custom environment simulating an adaptive diffusion process."""
+    def __init__(self, epLen, starting_state):
+        self.epLen = epLen
+        self.state = starting_state
+        self.starting_state = starting_state
+        self.timestep = 0
+        self._final_step = epLen - 1
 
-        if new_x < self._domain_lo:
-            new_x = self._domain_lo
-            self.projection_count += 1
-        elif new_x > self._domain_hi:
-            new_x = self._domain_hi
-            self.projection_count += 1
+    def get_epLen(self):
+        return self.epLen
 
-        self.state[0] = new_x
+    def reset(self):
+        self.timestep = 0
+        self.state = self.starting_state
 
-        reward = cfg.reward_step_fn(np.array([x], dtype=np.float64), action)
+    def advance(self, action):
+        action_sum = np.sum(action)
+        noise = np.random.randn(action_dim)
+        state = self.state  
 
+        new_state = state + theta * state * Delta + kappa * state * action_sum * Delta + \
+                    sigma * state * _SQRT_DELTA * np.dot(action, noise)
+        # Handles out-of-bound rho by forcing the new_state to be within the bounds
+        new_state = np.clip(new_state, -rho, rho)
+
+        reward = 0
+        if self.timestep == self._final_step:
+            reward = (10 - new_state) * new_state
+
+        self.state = new_state
         self.timestep += 1
-        pContinue = 1 if self.timestep < self.epLen else 0
 
-        return reward, self.state, pContinue
+        pContinue = 1
+        if self.timestep == self.epLen:
+            pContinue = 0
 
+        return reward, new_state, pContinue
 
-class Experiment:
-    """Runs episodes and collects cumulative rewards for one agent-environment pair."""
-    __slots__ = ('env', 'agent', 'nEps', 'epLen', 'data', 'arms', '_seed')
+class Experiment(object):
 
-    def __init__(self, env: Environment, agent: Agent, cfg: ExpConfig, seed: int):
+    def __init__(self, env, agent_list, dict):
+        assert isinstance(env, Environment)
+
+        self.seed = dict['seed']
+        self.epFreq = dict['recFreq']
+        self.targetPath = dict['targetPath']
+        self.deBug = dict['deBug']
+        self.nEps = dict['nEps']
         self.env = env
-        self.agent = agent
-        self.nEps = cfg.nEps
         self.epLen = env.get_epLen()
-        self.data = np.zeros(self.nEps, dtype=np.float64)
-        self.arms = np.zeros(self.nEps, dtype=np.float64)
-        self._seed = seed
+        self.num_iters = dict['numIters']
+        self.agent_list = agent_list
+        self.data = np.zeros([dict['nEps'] * self.num_iters, 4])
+        np.random.seed(self.seed)
 
-    def run(self) -> Tuple[np.ndarray, np.ndarray]:
-        """Execute all episodes and return arrays of per-episode rewards and active balls."""
-        np.random.seed(self._seed)
+    def run(self):
+        print('**************************************************')
+        print('Running experiment')
+        print('**************************************************')
 
-        env_reset = self.env.reset
-        env_advance = self.env.advance
-        agent_update_policy = self.agent.update_policy
-        agent_pick_action = self.agent.pick_action
-        agent_update_obs = self.agent.update_obs
-        agent_get_num_arms = self.agent.get_num_arms
-        env_state = self.env
-        epLen = self.epLen
+        env = self.env
+        deBug = self.deBug
+        epLen_local = env.epLen
         data = self.data
-        arms = self.arms
 
-        for ep in range(self.nEps):
-            env_reset()
-            state = env_state.state.copy()
-            epReward = 0.0
-            agent_update_policy(ep)
+        for i in range(self.num_iters):
+            agent = self.agent_list[i]
+            for ep in range(1, nEps + 1):
+                env.reset()
+                oldState = env.state
+                epReward = 0
+                agent.update_policy(ep)
+                pContinue = 1
+                h = 0
 
-            for h in range(epLen):
-                action = agent_pick_action(state, h)
-                reward, new_state, pContinue = env_advance(action)
-                epReward += reward
-                agent_update_obs(state, action, reward, new_state, h)
+                if deBug:
+                    while pContinue > 0 and h < epLen_local:
+                        print('state : ' + str(oldState))
+                        action = agent.pick_action(oldState, h)
+                        print('action : ' + str(action))
+                        reward, newState, pContinue = env.advance(action)
+                        epReward += reward
+                        agent.update_obs(oldState, action, reward, newState, h)
+                        oldState = newState
+                        h += 1
+                    print('final state: ' + str(newState))
+                    print('Total Reward: ' + str(epReward))
+                else:
+                    while pContinue > 0 and h < epLen_local:
+                        action = agent.pick_action(oldState, h)
+                        reward, newState, pContinue = env.advance(action)
+                        epReward += reward
+                        agent.update_obs(oldState, action, reward, newState, h)
+                        oldState = newState
+                        h += 1
 
-                if not pContinue:
-                    break
+                index = ep - 1
+                data[index, 0] = index
+                data[index, 1] = i
+                data[index, 2] = epReward
+                data[index, 3] = agent.get_num_arms()
 
-                state[0] = new_state[0]
+        print('**************************************************')
+        print('Experiment complete')
+        print('**************************************************')
 
-            data[ep] = epReward
-            arms[ep] = agent_get_num_arms()
+    def save_data(self):
+       print('**************************************************')
+       print('Saving data')
+       print('**************************************************')
+       dt = pd.DataFrame(self.data, columns=['episode', 'iteration', 'epReward', 'Number_of_Balls'])
+       dt = dt[(dt.T != 0).any()]
+       return dt
 
-        return data, arms
 
+class Node():
+    """Represents a node in the state-action space partition."""
 
-class Node:
-    """
-    Represents a hypercube cell in the adaptive partition.
+    __slots__ = ('qVal', 'rEst', 'muEst', 'sigmaEst', 'num_visits',
+                 'num_unique_visits', 'num_splits', 'state_val', 'action_val',
+                 'radius', 'action_radius', 'children')
 
-    Each node covers an L-inf ball in state-action space and maintains
-    estimates for Q-value, reward, drift, and variance.
-    """
-    __slots__ = (
-        'qVal', 'rEst', 'muEst', 'sigmaEst',
-        'num_visits', 'num_unique_visits', 'num_splits',
-        'state_val', 'action_val', 'radius', 'action_radius',
-        'children', '_state_center', '_action_center'
-    )
-
-    def __init__(self, qVal: float, rEst: float,
-                 muEst: np.ndarray, sigmaEst: np.ndarray,
-                 num_visits: int, num_unique_visits: int, num_splits: int,
-                 state_val: np.ndarray, action_val: np.ndarray,
-                 radius: float, action_radius: float):
+    def __init__(self, qVal, rEst, muEst, sigmaEst, num_visits, num_unique_visits,
+                 num_splits, state_val, action_val, radius, action_radius):
         self.qVal = qVal
         self.rEst = rEst
         self.muEst = muEst
@@ -212,705 +249,267 @@ class Node:
         self.num_unique_visits = num_unique_visits
         self.num_splits = num_splits
         self.state_val = state_val
-        self.action_val = action_val
+        self.action_val = np.asarray(action_val, dtype=np.float64)
         self.radius = radius
         self.action_radius = action_radius
-        self.children: Optional[List['Node']] = None
-        self._state_center = float(state_val[0])
-        self._action_center = float(action_val[0])
+        self.children = None
 
-    def contains_1d(self, state_scalar: float) -> bool:
-        """Check if state lies within this node's L-inf ball (1D version)."""
-        return abs(state_scalar - self._state_center) <= self.radius
-
-    def contains(self, state: np.ndarray) -> bool:
-        """Check if state lies within this node's L-inf ball."""
-        return abs(state[0] - self._state_center) <= self.radius
-
-    def split_node_1d(self, initial_q: float, inherit_flag: bool = False) -> List['Node']:
-        """Split node into 4 children by halving state and action radii."""
-        half_r = self.radius * 0.5
-        half_ar = self.action_radius * 0.5
-        sc = self._state_center
-        ac = self._action_center
+    def split_node(self, flag, epLen):
+        half_radius = self.radius * 0.5  # CHANGE 14: Precompute halved values
+        half_action_radius = self.action_radius * 0.5
+        action_val = self.action_val
+        state_val = self.state_val
+        num_splits_plus1 = self.num_splits + 1
+        low_visits = self.num_visits <= 1
 
         children = []
-        inherit = inherit_flag and self.num_visits > 1
 
-        if inherit:
-            qVal_init = self.qVal
-            rEst_init = self.rEst
-            muEst_init = self.muEst.copy()
-            sigmaEst_init = self.sigmaEst.copy()
-            visits_init = self.num_visits
-            unique_init = self.num_visits
-        else:
-            qVal_init = initial_q
-            rEst_init = 0.0
-            muEst_init = np.zeros(1, dtype=np.float64)
-            sigmaEst_init = np.zeros(1, dtype=np.float64)
-            visits_init = self.num_visits
-            unique_init = 0
+        for s_off in _STATE_OFFSETS:
+            new_state = state_val + s_off * half_radius
 
-        num_splits_new = self.num_splits + 1
+            for a_offs in _ACTION_OFFSETS:
+                new_action = action_val + a_offs * half_action_radius
 
-        for s_sign in (-1, 1):
-            new_sc = sc + s_sign * half_r
-            new_state = np.array([new_sc], dtype=np.float64)
-
-            for a_sign in (-1, 1):
-                new_ac = ac + a_sign * half_ar
-                new_action = np.array([new_ac], dtype=np.float64)
-
-                child = Node(
-                    qVal_init, rEst_init,
-                    muEst_init if not inherit else muEst_init.copy(),
-                    sigmaEst_init if not inherit else sigmaEst_init.copy(),
-                    visits_init, unique_init, num_splits_new,
-                    new_state, new_action, half_r, half_ar
-                )
+                if low_visits:
+                    child = Node(initial_q, 0, 0, 0, self.num_visits, 0,
+                               num_splits_plus1, new_state, new_action,
+                               half_radius, half_action_radius)
+                else:
+                    child = Node(self.qVal, self.rEst, self.muEst, self.sigmaEst,
+                               self.num_visits, self.num_visits, num_splits_plus1,
+                               new_state, new_action, half_radius, half_action_radius)
                 children.append(child)
 
         self.children = children
+        return self.children
+
+
+class Tree():
+    """Manages the hierarchy of nodes for a specific timestep."""
+
+    def __init__(self, epLen, flag):
+        self.head = Node(initial_q, 0, 0, 0, 0, 0, 0, 0, np.full(action_dim, 0.5), rho, rho_1)
+        self.epLen = epLen
+        self.flag = flag
+        self.state_leaves = [self.head.state_val]
+        self.vEst = [initial_q]
+        self.tree_leaves = [self.head]
+        self._min_vEst = initial_q
+
+    def get_head(self):
+        return self.head
+
+    def _update_min_vEst(self):
+        """CHANGE 18: Helper to update cached min when vEst changes."""
+        self._min_vEst = min(self.vEst)
+
+    def split_node(self, node, timestep, previous_tree):
+        children = node.split_node(self.flag, self.epLen)
+
+        self.tree_leaves.remove(node)
+        self.tree_leaves.extend(children)
+
+        child_1_state = children[0].state_val
+        child_1_radius = children[0].radius
+
+        state_leaves = self.state_leaves
+        min_dist = min(abs(sl - child_1_state) for sl in state_leaves)
+
+        if min_dist >= child_1_radius:
+            parent = node.state_val
+            parent_index = state_leaves.index(parent)
+            parent_vEst = self.vEst[parent_index]
+
+            state_leaves.pop(parent_index)
+            self.vEst.pop(parent_index)
+
+            state_leaves.append(children[0].state_val)
+            state_leaves.append(children[_NUM_ACTION_OFFSETS].state_val)
+            self.vEst.append(parent_vEst)
+            self.vEst.append(parent_vEst)
+            self._update_min_vEst()
+
         return children
 
-
-class Tree:
-    """
-    Adaptive partition tree for one timestep.
-
-    Maintains a hierarchical partition of state-action space where each leaf
-    node tracks Q-value estimates. Supports dynamic refinement via splitting.
-    """
-    __slots__ = ('cfg', 'initial_q', 'head', 'tree_leaves',
-                 'state_leaves', 'vEst', '_state_to_idx', 'min_vEst',
-                 '_lookup_cache', '_vEst_dirty', 'inherit_flag')
-
-    def __init__(self, cfg: ExpConfig):
-        self.cfg = cfg
-        self.initial_q = cfg.initial_q
-        self.inherit_flag = cfg.inherit_flag
-
-        start_state = np.array([0.0], dtype=np.float64)
-        start_action = np.array([5.0], dtype=np.float64)
-
-        self.head = Node(
-            cfg.initial_q, 0.0,
-            np.zeros(1, dtype=np.float64), np.zeros(1, dtype=np.float64),
-            0, 0, 0,
-            start_state, start_action, cfg.rho, cfg.rho_1
-        )
-
-        self.tree_leaves: Dict[int, Node] = {id(self.head): self.head}
-        self.state_leaves: List[float] = [0.0]
-        self.vEst: List[float] = [float(cfg.initial_q)]
-        self._state_to_idx: Dict[float, int] = {0.0: 0}
-        self.min_vEst: float = float(cfg.initial_q)
-        self._lookup_cache: Dict[float, Node] = {}
-        self._vEst_dirty = False
-
-    def get_active_ball_1d(self, state_scalar: float) -> Tuple[Node, float]:
-        """Find the deepest leaf node containing the given state (1D version)."""
-        cached = self._lookup_cache.get(state_scalar)
-        if cached is not None and cached.children is None:
-            return cached, cached.qVal
-
-        node = self.head
-        while node.children is not None:
-            best_node = None
-            best_q = -math.inf
-
-            for child in node.children:
-                if child.contains_1d(state_scalar):
-                    if child.qVal >= best_q:
-                        best_q = child.qVal
-                        best_node = child
-
-            if best_node is None:
-                break
-            node = best_node
-
-        self._lookup_cache[state_scalar] = node
-        return node, node.qVal
-
-    def get_active_ball(self, state: np.ndarray) -> Tuple[Node, float]:
-        """Find the deepest leaf node containing the given state."""
-        return self.get_active_ball_1d(state[0])
-
-    def split_node_1d(self, node: Node) -> List[Node]:
-        """Split a node and update internal bookkeeping structures."""
-        children = node.split_node_1d(self.initial_q, self.inherit_flag)
-
-        del self.tree_leaves[id(node)]
-        for child in children:
-            self.tree_leaves[id(child)] = child
-
-        self._lookup_cache.clear()
-
-        child_0_center = children[0]._state_center
-        child_0_radius = children[0].radius
-
-        needs_new_states = True
-        for sc in self.state_leaves:
-            if abs(sc - child_0_center) < child_0_radius:
-                needs_new_states = False
-                break
-
-        if needs_new_states:
-            parent_center = node._state_center
-            parent_idx = self._state_to_idx.get(parent_center)
-
-            if parent_idx is not None:
-                parent_vest = self.vEst[parent_idx]
-
-                self.state_leaves.pop(parent_idx)
-                self.vEst.pop(parent_idx)
-                del self._state_to_idx[parent_center]
-
-                self._state_to_idx = {s: i for i, s in enumerate(self.state_leaves)}
-
-                seen_states = set()
-                for child in children:
-                    sc = child._state_center
-                    if sc not in seen_states and sc not in self._state_to_idx:
-                        seen_states.add(sc)
-                        idx = len(self.state_leaves)
-                        self.state_leaves.append(sc)
-                        self.vEst.append(parent_vest)
-                        self._state_to_idx[sc] = idx
-
-                self.min_vEst = min(self.vEst) if self.vEst else self.initial_q
-
-        self._vEst_dirty = True
-        return children
-
-    def update_vEst(self) -> None:
-        """Refresh value estimates for all tracked state centers."""
-        if not self._vEst_dirty and len(self.tree_leaves) == 1:
-            return
-
-        initial_q = self.initial_q
-        min_v = math.inf
-
-        for i, sc in enumerate(self.state_leaves):
-            _, qMax = self.get_active_ball_1d(sc)
-            v = min(qMax, initial_q, self.vEst[i])
-            self.vEst[i] = v
-            if v < min_v:
-                min_v = v
-
-        self.min_vEst = min_v if min_v != math.inf else initial_q
-        self._vEst_dirty = False
-
-    def get_number_of_active_balls(self) -> int:
-        """Return the number of leaf nodes in the partition."""
+    def get_number_of_active_balls(self):
         return len(self.tree_leaves)
+
+    def get_num_balls(self, node):
+        if node.children is None:
+            return 1
+        num_balls = 0
+        for child in node.children:
+            num_balls += self.get_num_balls(child)
+        return num_balls
+
+    def get_active_ball_recursion(self, state, node):
+        if node.children is None:
+            return node, node.qVal
+
+        active_node = None
+        qVal = -math.inf
+
+        for child in node.children:
+            if abs(state - child.state_val) <= child.radius:
+                new_node, new_qVal = self.get_active_ball_recursion(state, child)
+                if new_qVal >= qVal:
+                    active_node = new_node
+                    qVal = new_qVal
+
+        if active_node is None:
+            return node, node.qVal
+
+        return active_node, qVal
+
+    def get_active_ball(self, state):
+        # Handles now out-of-bound rho trees
+        safe_state = np.clip(state, 
+                            self.head.state_val - self.head.radius, 
+                            self.head.state_val + self.head.radius)
+        
+        active_node, qVal = self.get_active_ball_recursion(safe_state, self.head)
+        return active_node, qVal
+
+    def state_within_node(self, state, node):
+        return abs(state - node.state_val) <= node.radius
 
 
 class AdaptiveModelBasedDiscretization(Agent):
-    """
-    APL-Diffusion agent implementing adaptive partition-based learning.
+    """Implements the Adaptive Model-Based Discretization agent."""
 
-    Maintains a separate partition tree for each timestep and performs
-    Bellman updates with UCB exploration bonuses. Nodes split when
-    sufficiently visited to refine the state-action discretization.
-    
-    Parameters:
-        use_bellman: If True, uses full Bellman updates with value propagation.
-                     If False, uses one-step updates (reward only).
-    """
-    __slots__ = ('cfg', 'epLen', 'scaling', 'alpha', 'split_threshold', 'lip',
-                 'initial_q', 'state_dim', 'tree_list', '_split_thresholds',
-                 'use_bellman', 'inherit_flag')
+    def __init__(self, epLen, numIters, scaling, split_threshold, inherit_flag, flag):
+        self.epLen = epLen
+        self.numIters = numIters
+        self.scaling = scaling
+        self.split_threshold = split_threshold
+        self.inherit_flag = inherit_flag
+        self.flag = flag
+        self.tree_list = [Tree(epLen, self.inherit_flag) for _ in range(epLen)]
+        self._final_step = epLen - 1
 
-    def __init__(self, cfg: ExpConfig):
-        self.cfg = cfg
-        self.epLen = cfg.epLen
-        self.scaling = cfg.scaling
-        self.alpha = cfg.alpha
-        self.split_threshold = cfg.split_threshold
-        self.lip = cfg.lip
-        self.initial_q = cfg.initial_q
-        self.state_dim = cfg.state_dim
-        self.use_bellman = cfg.use_bellman
-        self.inherit_flag = cfg.inherit_flag
+    def reset(self):
+        self.tree_list = [Tree(self.epLen, self.inherit_flag) for _ in range(self.epLen)]
 
-        self._split_thresholds = [
-            2 ** (cfg.split_threshold * i) for i in range(21)
-        ]
+    def get_num_arms(self):
+        return sum(tree.get_number_of_active_balls() for tree in self.tree_list)
 
-        self.tree_list = [Tree(cfg) for _ in range(cfg.epLen)]
-
-    def reset(self) -> None:
-        """Reset all partition trees to initial state."""
-        self.tree_list = [Tree(self.cfg) for _ in range(self.epLen)]
-
-    def get_num_arms(self) -> int:
-        """Return total number of leaf nodes across all timesteps."""
-        return sum(t.get_number_of_active_balls() for t in self.tree_list)
-
-    def update_obs(self, obs: np.ndarray, action: np.ndarray,
-                   reward: float, newObs: np.ndarray, timestep: int) -> None:
-        """Update estimates based on observed transition and possibly split."""
+    def update_obs(self, obs, action, reward, newObs, timestep):
         tree = self.tree_list[timestep]
-        obs_scalar = obs[0]
-        active_node, _ = tree.get_active_ball_1d(obs_scalar)
+        active_node, _ = tree.get_active_ball(obs)
 
         active_node.num_visits += 1
         active_node.num_unique_visits += 1
         t = active_node.num_unique_visits
 
-        active_node.rEst = ((t - 1) * active_node.rEst + reward) / t
+        inv_t = 1.0 / t
+        t_minus_1_ratio = (t - 1) * inv_t
 
-        is_terminal = timestep == self.epLen - 1
-        if not is_terminal:
-            delta = newObs[0] - obs_scalar
-            old_mu = active_node.muEst[0]
-            new_mu = ((t - 1) * old_mu + delta) / t
-            active_node.muEst[0] = new_mu
-            active_node.sigmaEst[0] = ((t - 1) * active_node.sigmaEst[0]
-                                       + (delta - new_mu) ** 2) / t
+        active_node.rEst = t_minus_1_ratio * active_node.rEst + reward * inv_t
 
-        scaling = self.scaling
-        ucb = scaling / (active_node.num_visits ** self.alpha) + scaling * active_node.radius
+        if timestep != self._final_step:
+            delta_state = newObs - obs
+            active_node.muEst = t_minus_1_ratio * active_node.muEst + delta_state * inv_t
+            active_node.sigmaEst = t_minus_1_ratio * active_node.sigmaEst + \
+                                   (delta_state - active_node.muEst) ** 2 * inv_t
 
-        if is_terminal:
-            q_new = active_node.rEst + ucb
-        else:
-            if self.use_bellman:
-                # Full Bellman update: use value function from next timestep
-                next_tree = self.tree_list[timestep + 1]
-                mu_sq = active_node.muEst[0] ** 2
-                sigma_sq = active_node.sigmaEst[0]
-                vEst_next = next_tree.min_vEst + self.lip * (1.0 + mu_sq + sigma_sq)
-                q_new = active_node.rEst + vEst_next + ucb
+        if not self.flag:
+            ucb_visit = self.scaling / math.sqrt(active_node.num_visits)
+            ucb_radius = self.scaling * active_node.radius
+
+            if timestep == self._final_step:
+                active_node.qVal = min(active_node.qVal, initial_q,
+                                       active_node.rEst + ucb_visit + ucb_radius)
             else:
-                # One-step update: only use immediate reward (no value propagation)
-                q_new = active_node.rEst + ucb
+                next_tree = self.tree_list[timestep + 1]
+                vEst = next_tree._min_vEst + lip * (1 + active_node.muEst ** 2 + active_node.sigmaEst ** 2)
+                active_node.qVal = min(active_node.qVal, initial_q,
+                                       active_node.rEst + vEst + ucb_visit + ucb_radius)
 
-        active_node.qVal = min(active_node.qVal, self.initial_q, q_new)
-        tree.update_vEst()
+            # Update V-estimates for this tree
+            vEst_list = tree.vEst
+            for idx, state_val in enumerate(tree.state_leaves):
+                _, qMax = tree.get_active_ball(state_val)
+                vEst_list[idx] = min(qMax, initial_q, vEst_list[idx])
+            tree._update_min_vEst()
 
-        num_splits = active_node.num_splits
-        if num_splits < len(self._split_thresholds):
-            threshold = self._split_thresholds[num_splits]
-        else:
-            threshold = 2 ** (self.split_threshold * num_splits)
+        if t >= 2 ** (self.split_threshold * active_node.num_splits):
+            if timestep >= 1:
+                tree.split_node(active_node, timestep, self.tree_list[timestep - 1])
+            else:
+                tree.split_node(active_node, timestep, None)
 
-        if t >= threshold:
-            tree.split_node_1d(active_node)
+    def update_policy(self, k):
+        if self.flag:
+            for h in range(self._final_step, -1, -1):
+                tree = self.tree_list[h]
+                for node in tree.tree_leaves:
+                    if node.num_unique_visits == 0:
+                        node.qVal = initial_q
+                    else:
+                        if h == self._final_step:
+                            node.qVal = min(node.qVal, initial_q,
+                                          node.rEst + self.scaling / math.sqrt(node.num_visits))
+                        else:
+                            next_tree = self.tree_list[h + 1]
+                            vEst = next_tree._min_vEst + lip * (1 + node.muEst ** 2 + node.sigmaEst ** 2)
+                            node.qVal = min(node.qVal, initial_q,
+                                          node.rEst + vEst + self.scaling / math.sqrt(node.num_visits))
 
-    def update_policy(self, k: int) -> None:
-        """Policy update hook (not used in this algorithm)."""
-        pass
+                vEst_list = tree.vEst
+                for idx, state_val in enumerate(tree.state_leaves):
+                    _, qMax = tree.get_active_ball(state_val)
+                    vEst_list[idx] = min(qMax, initial_q, vEst_list[idx])
+                tree._update_min_vEst()
 
-    def pick_action(self, state: np.ndarray, timestep: int) -> np.ndarray:
-        """Select action uniformly from the active node's action region."""
+    def split_ball(self, node):
+        children = node.split_ball()
+        return children
+
+    def greedy(self, state, timestep, epsilon=0):
         tree = self.tree_list[timestep]
-        active_node, _ = tree.get_active_ball_1d(state[0])
+        active_node, _ = tree.get_active_ball(state)
 
-        ac = active_node._action_center
-        ar = active_node.action_radius
-
-        lo = max(0.0, ac - ar)
-        hi = min(10.0, ac + ar)
-
-        return np.array([np.random.uniform(lo, hi)], dtype=np.float64)
-
-
-def run_one_seed(seed: int, cfg: ExpConfig) -> Tuple[np.ndarray, np.ndarray]:
-    """Execute a single experiment run with the given random seed."""
-    env = LinearDiffEnvironment(cfg)
-    agent = AdaptiveModelBasedDiscretization(cfg)
-    exp = Experiment(env, agent, cfg, seed)
-    rewards, arms = exp.run()
-    return rewards, arms
-
-
-def run_one_seed_timed(seed: int, cfg: ExpConfig) -> Tuple[np.ndarray, np.ndarray, float]:
-    """Execute a single experiment run with timing."""
-    start_time = time.time()
-    env = LinearDiffEnvironment(cfg)
-    agent = AdaptiveModelBasedDiscretization(cfg)
-    exp = Experiment(env, agent, cfg, seed)
-    rewards, arms = exp.run()
-    duration = time.time() - start_time
-    return rewards, arms, duration
-
-
-def run_experiment(configs: List[ExpConfig], n_jobs: int = -1) -> Dict[str, Dict[str, np.ndarray]]:
-    """Run experiments for all configurations, parallelizing across seeds."""
-    results = {}
-
-    for cfg in configs:
-        print(f"\n--- Running: {cfg.label} ---")
-
-        seed_runs = Parallel(n_jobs=n_jobs, prefer="threads")(
-            delayed(run_one_seed)(seed, cfg) for seed in range(cfg.n_seeds)
+        action = _INV_ACTION_DIM * np.random.uniform(
+            active_node.action_val - active_node.action_radius,
+            active_node.action_val + active_node.action_radius
         )
+        return action
 
-        reward_matrix = np.vstack([r for r, a in seed_runs])
-        arm_matrix = np.vstack([a for r, a in seed_runs])
-
-        results[cfg.label] = {
-            "vpi": reward_matrix.mean(axis=0),
-            "vpi_std": reward_matrix.std(axis=0),
-            "arms": arm_matrix.mean(axis=0)
-        }
-
-        final_mean = results[cfg.label]["vpi"][-100:].mean()
-        print(f"    Done. Final mean VPI: {final_mean:.3f}")
-
-    return results
+    def pick_action(self, state, timestep):
+        action = self.greedy(state, timestep)
+        return action
 
 
-def run_comparative_study(n_jobs: int = -1) -> Dict[str, Dict]:
-    """
-    Run comparative study between Full Bellman and One-Step update strategies.
-    
-    Returns a dictionary with results for both strategies including:
-    - VPI (value per iteration)
-    - Arms (number of active balls)
-    - Timing information
-    """
-    results = {}
-    
-    # Configuration for Full Bellman (High precision, Higher cost)
-    cfg_bellman = ExpConfig(
-        state_dim=1,
-        action_dim=1,
-        epLen=10,
-        nEps=2000,
-        n_seeds=10,
-        starting_state=4.0,
-        domain_lo=-50.0,
-        domain_hi=50.0,
-        initial_q=1837.1,
-        rho=10.0,
-        rho_1=5.0,
-        lip=1.0,
-        split_threshold=2,
-        scaling=5.0,
-        alpha=0.5,
-        theta_0=0.05,
-        theta_x=-0.1,
-        theta_a=0.01,
-        sigma=0.1,
-        delta=1.0,
-        reward_step_fn=reward_6_1,
-        label='Full Bellman Update',
-        use_bellman=True,
-        inherit_flag=False,
-    )
-    
-    # Configuration for One-Step (Lower precision, Lower cost)
-    cfg_one_step = ExpConfig(
-        state_dim=1,
-        action_dim=1,
-        epLen=10,
-        nEps=2000,
-        n_seeds=10,
-        starting_state=4.0,
-        domain_lo=-50.0,
-        domain_hi=50.0,
-        initial_q=1837.1,
-        rho=10.0,
-        rho_1=5.0,
-        lip=1.0,
-        split_threshold=2,
-        scaling=5.0,
-        alpha=0.5,
-        theta_0=0.05,
-        theta_x=-0.1,
-        theta_a=0.01,
-        sigma=0.1,
-        delta=1.0,
-        reward_step_fn=reward_6_1,
-        label='One-Step Update',
-        use_bellman=False,
-        inherit_flag=False,
-    )
-    
-    configs = [cfg_bellman, cfg_one_step]
-    
-    for cfg in configs:
-        print(f"\n--- Running Comparative Study: {cfg.label} ---")
-        print(f"    use_bellman={cfg.use_bellman}, inherit_flag={cfg.inherit_flag}")
-        
-        start_time = time.time()
-        
-        # Run experiments with timing
-        seed_runs = Parallel(n_jobs=n_jobs, prefer="threads")(
-            delayed(run_one_seed_timed)(seed, cfg) for seed in range(cfg.n_seeds)
-        )
-        
-        total_time = time.time() - start_time
-        
-        reward_matrix = np.vstack([r for r, a, t in seed_runs])
-        arm_matrix = np.vstack([a for r, a, t in seed_runs])
-        seed_times = np.array([t for r, a, t in seed_runs])
-        
-        results[cfg.label] = {
-            "vpi": reward_matrix.mean(axis=0),
-            "vpi_std": reward_matrix.std(axis=0),
-            "arms": arm_matrix.mean(axis=0),
-            "arms_std": arm_matrix.std(axis=0),
-            "total_time": total_time,
-            "mean_seed_time": seed_times.mean(),
-            "std_seed_time": seed_times.std(),
-            "use_bellman": cfg.use_bellman,
-        }
-        
-        final_mean = results[cfg.label]["vpi"][-100:].mean()
-        final_std = results[cfg.label]["vpi_std"][-100:].mean()
-        print(f"    Done. Final mean VPI: {final_mean:.3f} ± {final_std:.3f}")
-        print(f"    Total time: {total_time:.2f}s, Mean per seed: {seed_times.mean():.2f}s")
-    
-    return results
 
+def make_diffMDP(epLen, starting_state):
+    return AdaDiffEnvironment(epLen, starting_state)
 
-def plot_vpi(results: Dict[str, Dict[str, np.ndarray]], smooth_window: int = 50,
-             save_path: str = 'vpi_section6_1.png') -> None:
-    """Plot VPI convergence curves with smoothing."""
-    fig, ax = plt.subplots(figsize=(10, 6))
-    colours = plt.cm.tab10(np.linspace(0, 0.8, len(results)))
+def run_single_experiment_iteration(iteration_seed):
+    env_single = make_diffMDP(epLen, starting_state)
+    agent_single = AdaptiveModelBasedDiscretization(epLen, nEps, scaling, split_threshold, False, False)
+    dictionary_single = {
+        'seed': iteration_seed, 'epFreq': 1,
+        'targetPath': './tmp_iter_{}.csv'.format(iteration_seed),
+        'deBug': False, 'nEps': nEps, 'recFreq': 10, 'numIters': 1
+    }
+    exp_single = Experiment(env_single, [agent_single], dictionary_single)
+    exp_single.run()
+    dt_data_single = exp_single.save_data()
+    # CHANGE 37: Return .values (numpy array) to avoid pickling overhead in joblib
+    return dt_data_single.epReward.values
 
-    for (label, series), colour in zip(results.items(), colours):
-        vpi = series["vpi"]
-        episodes = np.arange(len(vpi))
+n = 50
 
-        cumsum = np.cumsum(np.insert(vpi, 0, 0))
-        smoothed = np.empty_like(vpi)
-        for i in range(len(vpi)):
-            start = max(0, i - smooth_window + 1)
-            smoothed[i] = (cumsum[i + 1] - cumsum[start]) / (i - start + 1)
+list_of_vpi = Parallel(n_jobs=-1)(delayed(run_single_experiment_iteration)(i) for i in range(n))
 
-        ax.plot(episodes, smoothed, label=label, color=colour, linewidth=2)
-        ax.plot(episodes, vpi, color=colour, alpha=0.12, linewidth=0.7)
+vpi_df = pd.DataFrame(list_of_vpi).T
+vpi_estimate = vpi_df.mean(axis=1)
 
-    ax.set_xlabel('Episode (K)', fontsize=13)
-    ax.set_ylabel('Mean VPI — estimated $V^{\\hat{\\pi}}$', fontsize=13)
-    ax.set_title('Section 6.1: VPI Convergence\n'
-                 'One-dimensional linear diffusion, reward $R_h \\sim \\mathcal{N}(-(x-a)^2, 0.01)$',
-                 fontsize=12)
-    ax.legend(fontsize=11)
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(save_path, dpi=150, bbox_inches='tight')
-    print(f'Plot saved to {save_path}')
-    plt.close(fig)
-
-
-def plot_comparative_study(results: Dict[str, Dict], smooth_window: int = 50,
-                           save_path: str = 'comparative_study.png') -> None:
-    """Plot comparative study results: VPI and Arms side by side."""
-    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
-    colours = {'Full Bellman Update': 'tab:blue', 'One-Step Update': 'tab:orange'}
-    
-    # Plot 1: VPI Convergence
-    ax1 = axes[0]
-    for label, series in results.items():
-        vpi = series["vpi"]
-        episodes = np.arange(len(vpi))
-        
-        cumsum = np.cumsum(np.insert(vpi, 0, 0))
-        smoothed = np.empty_like(vpi)
-        for i in range(len(vpi)):
-            start = max(0, i - smooth_window + 1)
-            smoothed[i] = (cumsum[i + 1] - cumsum[start]) / (i - start + 1)
-        
-        color = colours.get(label, 'tab:gray')
-        ax1.plot(episodes, smoothed, label=label, color=color, linewidth=2)
-        ax1.plot(episodes, vpi, color=color, alpha=0.12, linewidth=0.7)
-    
-    ax1.set_xlabel('Episode (K)', fontsize=12)
-    ax1.set_ylabel('Mean VPI', fontsize=12)
-    ax1.set_title('VPI Convergence Comparison', fontsize=12)
-    ax1.legend(fontsize=10)
-    ax1.grid(True, alpha=0.3)
-    
-    # Plot 2: Number of Active Balls
-    ax2 = axes[1]
-    for label, series in results.items():
-        arms = series["arms"]
-        episodes = np.arange(len(arms))
-        color = colours.get(label, 'tab:gray')
-        ax2.plot(episodes, arms, label=label, color=color, linewidth=2)
-    
-    ax2.set_xlabel('Episode (K)', fontsize=12)
-    ax2.set_ylabel('Number of Active Balls', fontsize=12)
-    ax2.set_title('Partition Complexity', fontsize=12)
-    ax2.legend(fontsize=10)
-    ax2.grid(True, alpha=0.3)
-    
-    # Plot 3: Timing Comparison (Bar Chart)
-    ax3 = axes[2]
-    labels = list(results.keys())
-    times = [results[l]["mean_seed_time"] for l in labels]
-    time_stds = [results[l]["std_seed_time"] for l in labels]
-    bar_colors = [colours.get(l, 'tab:gray') for l in labels]
-    
-    bars = ax3.bar(labels, times, yerr=time_stds, capsize=5, color=bar_colors, alpha=0.8)
-    ax3.set_ylabel('Time per Seed (seconds)', fontsize=12)
-    ax3.set_title('Computational Cost', fontsize=12)
-    ax3.grid(True, alpha=0.3, axis='y')
-    
-    # Add value labels on bars
-    for bar, time_val in zip(bars, times):
-        height = bar.get_height()
-        ax3.annotate(f'{time_val:.2f}s',
-                     xy=(bar.get_x() + bar.get_width() / 2, height),
-                     xytext=(0, 3), textcoords="offset points",
-                     ha='center', va='bottom', fontsize=10)
-    
-    fig.suptitle('Bellman vs One-Step Update: Comparative Study\n'
-                 'Linear Diffusion Environment (Section 6.1)', fontsize=14, y=1.02)
-    fig.tight_layout()
-    fig.savefig(save_path, dpi=150, bbox_inches='tight')
-    print(f'Comparative study plot saved to {save_path}')
-    plt.close(fig)
-
-
-def print_comparative_summary(results: Dict[str, Dict]) -> None:
-    """Print a summary table of the comparative study results."""
-    print("\n" + "=" * 70)
-    print("COMPARATIVE STUDY SUMMARY: Full Bellman vs One-Step Update")
-    print("=" * 70)
-    
-    headers = ["Metric", "Full Bellman", "One-Step", "Difference"]
-    print(f"\n{headers[0]:<30} {headers[1]:<15} {headers[2]:<15} {headers[3]:<15}")
-    print("-" * 70)
-    
-    bellman = results.get('Full Bellman Update', {})
-    one_step = results.get('One-Step Update', {})
-    
-    if bellman and one_step:
-        # Final VPI (last 100 episodes)
-        bellman_vpi = bellman["vpi"][-100:].mean()
-        one_step_vpi = one_step["vpi"][-100:].mean()
-        diff_vpi = bellman_vpi - one_step_vpi
-        print(f"{'Final VPI (last 100 eps)':<30} {bellman_vpi:<15.3f} {one_step_vpi:<15.3f} {diff_vpi:+.3f}")
-        
-        # Final Arms
-        bellman_arms = bellman["arms"][-1]
-        one_step_arms = one_step["arms"][-1]
-        diff_arms = bellman_arms - one_step_arms
-        print(f"{'Final Active Balls':<30} {bellman_arms:<15.0f} {one_step_arms:<15.0f} {diff_arms:+.0f}")
-        
-        # Timing
-        bellman_time = bellman["mean_seed_time"]
-        one_step_time = one_step["mean_seed_time"]
-        speedup = bellman_time / one_step_time if one_step_time > 0 else float('inf')
-        print(f"{'Mean Time per Seed (s)':<30} {bellman_time:<15.2f} {one_step_time:<15.2f} {speedup:.2f}x")
-        
-        # Convergence speed (episode to reach 90% of final performance)
-        def get_convergence_episode(vpi, threshold_pct=0.9):
-            final_val = vpi[-100:].mean()
-            threshold = final_val * threshold_pct
-            for i, v in enumerate(vpi):
-                if v >= threshold:
-                    return i
-            return len(vpi)
-        
-        bellman_conv = get_convergence_episode(bellman["vpi"])
-        one_step_conv = get_convergence_episode(one_step["vpi"])
-        diff_conv = bellman_conv - one_step_conv
-        print(f"{'Episodes to 90% Final VPI':<30} {bellman_conv:<15d} {one_step_conv:<15d} {diff_conv:+d}")
-    
-    print("=" * 70)
-    print("\nInterpretation:")
-    print("- Full Bellman: Uses complete value function propagation (higher precision)")
-    print("- One-Step: Uses only immediate rewards (lower computational cost)")
-    print("=" * 70 + "\n")
-
-
-CFG_6_1 = ExpConfig(
-    state_dim=1,
-    action_dim=1,
-    epLen=10,
-    nEps=2000,
-    n_seeds=10,
-    starting_state=4.0,
-    domain_lo=-50.0,
-    domain_hi=50.0,
-    initial_q=1837.1,
-    rho=10.0,
-    rho_1=5.0,
-    lip=1.0,
-    split_threshold=2,
-    scaling=5.0,
-    alpha=0.5,
-    theta_0=0.05,
-    theta_x=-0.1,
-    theta_a=0.01,
-    sigma=0.1,
-    delta=1.0,
-    reward_step_fn=reward_6_1,
-    label='Section 6.1 — Linear diffusion',
-    use_bellman=True,
-    inherit_flag=False,
-)
-
-
-if __name__ == '__main__':
-    # ========================================
-    # Part 1: Original Section 6.1 Experiment
-    # ========================================
-    print("\n" + "=" * 70)
-    print("PART 1: Original Section 6.1 Experiment")
-    print("=" * 70)
-    
-    results = run_experiment([CFG_6_1], n_jobs=-1)
-    plot_vpi(results, smooth_window=50, save_path='vpi_section6_1.png')
-
-    df_vpi = pd.DataFrame({k: v["vpi"] for k, v in results.items()})
-    df_vpi.index.name = 'episode'
-    df_vpi.to_csv('vpi_section6_1.csv', index=False)
-
-    df_arms = pd.DataFrame({k: v["arms"] for k, v in results.items()})
-    df_arms.index.name = 'episode'
-    df_arms.to_csv('arms_section6_1.csv', index=False)
-
-    print('Data saved to vpi_section6_1.csv and arms_section6_1.csv')
-
-    # ========================================
-    # Part 2: Comparative Study (Bellman vs One-Step)
-    # ========================================
-    print("\n" + "=" * 70)
-    print("PART 2: Comparative Study - Full Bellman vs One-Step Update")
-    print("=" * 70)
-    
-    comparative_results = run_comparative_study(n_jobs=-1)
-    
-    # Plot comparative results
-    plot_comparative_study(comparative_results, smooth_window=50, 
-                           save_path='comparative_study.png')
-    
-    # Print summary
-    print_comparative_summary(comparative_results)
-    
-    # Save comparative study data
-    df_comp_vpi = pd.DataFrame({k: v["vpi"] for k, v in comparative_results.items()})
-    df_comp_vpi.index.name = 'episode'
-    df_comp_vpi.to_csv('comparative_vpi.csv', index=False)
-    
-    df_comp_arms = pd.DataFrame({k: v["arms"] for k, v in comparative_results.items()})
-    df_comp_arms.index.name = 'episode'
-    df_comp_arms.to_csv('comparative_arms.csv', index=False)
-    
-    # Save timing summary
-    timing_summary = pd.DataFrame({
-        'Method': list(comparative_results.keys()),
-        'Total Time (s)': [v["total_time"] for v in comparative_results.values()],
-        'Mean Time per Seed (s)': [v["mean_seed_time"] for v in comparative_results.values()],
-        'Std Time per Seed (s)': [v["std_seed_time"] for v in comparative_results.values()],
-        'Final VPI': [v["vpi"][-100:].mean() for v in comparative_results.values()],
-        'Final Arms': [v["arms"][-1] for v in comparative_results.values()],
-    })
-    timing_summary.to_csv('comparative_timing.csv', index=False)
-    
-    print('Comparative study data saved to:')
-    print('  - comparative_vpi.csv')
-    print('  - comparative_arms.csv')
-    print('  - comparative_timing.csv')
-    print('  - comparative_study.png')
+plt.figure(figsize=(10, 6))
+plt.plot(range(len(vpi_estimate)), vpi_estimate, label='vpi')
+plt.xlabel("Episode")
+plt.ylabel("vpi")
+plt.title("vpi vs episode")
+plt.legend()
+plt.grid(True)
+plt.show()
