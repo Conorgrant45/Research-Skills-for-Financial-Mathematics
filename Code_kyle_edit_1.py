@@ -719,7 +719,7 @@ class AdaptiveModelBasedDiscretization(Agent):
     
     
     
-#%%
+#%% Trying the paths for different values of the scaling parameter
 start = time.time()
 
 scaling_vec =[ 0.01, 0.05, 0.1, 0.5, 1, 5, 10, 50, 100, 500] # A scaling constant for the UCB (Upper Confidence Bound) bonus term, balancing exploration and exploitation.
@@ -852,3 +852,142 @@ for scaling in scaling_vec:
 end = time.time()
 
 print('func time', end - start)
+
+#%%
+# Number of balls vs episode plot
+start = time.time()
+
+scaling_vec = [0.01, 0.05, 0.1, 0.5, 1, 5, 10, 50, 100, 500]
+
+from joblib import Parallel, delayed
+
+n = 2
+
+plt.figure(figsize=(10, 6))
+
+for scaling in scaling_vec:
+
+    def run_single_experiment_iteration(iteration_seed):
+        env_single = AdaDiffEnvironment(epLen, starting_state)
+
+        agent_single = AdaptiveModelBasedDiscretization(
+            epLen, nEps, scaling, split_threshold, False, False
+        )
+
+        dictionary_single = {
+            'seed': iteration_seed,
+            'epFreq': 1,
+            'targetPath': f'./tmp_iter_{iteration_seed}.csv',
+            'deBug': False,
+            'nEps': nEps,
+            'recFreq': 10,
+            'numIters': 1
+        }
+
+        exp_single = Experiment(env_single, [agent_single], dictionary_single)
+        exp_single.run()
+        dt_data_single = exp_single.save_data()
+
+        return dt_data_single['Number_of_Balls'].values
+
+    list_of_balls = Parallel(n_jobs=-1)(
+        delayed(run_single_experiment_iteration)(i) for i in range(n)
+    )
+
+    balls_df = pd.DataFrame(list_of_balls).T
+    balls_mean = balls_df.mean(axis=1)
+
+    plt.plot(range(len(balls_mean)), balls_mean, label=f'scaling = {scaling}')
+
+plt.xlabel("Episode")
+plt.ylabel("Number of balls")
+plt.title("Number of balls vs episode for different scaling values")
+plt.legend()
+plt.grid(True)
+plt.show()
+
+end = time.time()
+print('func time', end - start)
+
+#%%
+start = time.time()
+
+scaling_vec = [0.01, 0.05, 0.1, 0.5, 1, 5, 10, 50, 100, 500]
+
+from joblib import Parallel, delayed
+
+n = 20
+
+plt.figure(figsize=(10, 6))
+
+runtime_records = []
+
+for scaling in scaling_vec:
+
+    scaling_start = time.time()
+
+    def run_single_experiment_iteration(iteration_seed):
+        env_single = AdaDiffEnvironment(epLen, starting_state)
+
+        agent_single = AdaptiveModelBasedDiscretization(
+            epLen, nEps, scaling, split_threshold, False, False
+        )
+
+        dictionary_single = {
+            'seed': iteration_seed,
+            'epFreq': 1,
+            'targetPath': f'./tmp_iter_{iteration_seed}.csv',
+            'deBug': False,
+            'nEps': nEps,
+            'recFreq': 10,
+            'numIters': 1
+        }
+
+        exp_single = Experiment(env_single, [agent_single], dictionary_single)
+        exp_single.run()
+        dt_data_single = exp_single.save_data()
+
+        return dt_data_single['Number_of_Balls'].values
+
+    list_of_balls = Parallel(n_jobs=-1)(
+        delayed(run_single_experiment_iteration)(i) for i in range(n)
+    )
+
+    balls_df = pd.DataFrame(list_of_balls).T
+    balls_mean = balls_df.mean(axis=1)
+
+    plt.plot(range(len(balls_mean)), balls_mean, label=f'scaling = {scaling}')
+
+    scaling_runtime = time.time() - scaling_start
+    runtime_records.append([scaling, scaling_runtime])
+
+plt.xlabel("Episode")
+plt.ylabel("Number of balls")
+plt.title("Number of balls vs episode for different scaling values")
+plt.legend()
+plt.grid(True)
+plt.show()
+
+runtime_table = pd.DataFrame(runtime_records, columns=["Scaling", "Runtime_seconds"])
+
+end = time.time()
+
+print("Total runtime:", end - start)
+print(runtime_table)
+
+
+runtime_table = pd.DataFrame(runtime_records, columns=["Scaling", "Runtime_seconds"])
+runtime_table["Runtime_seconds"] = runtime_table["Runtime_seconds"].round(3)
+runtime_table = runtime_table.sort_values("Scaling").reset_index(drop=True)
+
+plt.figure(figsize=(8,5))
+
+plt.bar(runtime_table["Scaling"].astype(str),
+        runtime_table["Runtime_seconds"])
+
+plt.xlabel("Scaling parameter")
+plt.ylabel("Runtime (seconds)")
+plt.title("Runtime vs Scaling parameter")
+
+plt.grid(axis="y")
+plt.show()
