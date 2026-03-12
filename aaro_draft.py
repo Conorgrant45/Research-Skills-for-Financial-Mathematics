@@ -27,19 +27,19 @@ and that agent always finds an active ball such that the code doesn't break.
 
 # Simulation parameters
 epLen = 30
-nEps = 2000
+nEps = 1500
 numIters = 1
 starting_state = 2
 theta = 0.05
-kappa = 0.1
+kappa = 0.8
 sigma = 0.2
 Delta = 1/52
 action_dim = 2
 
 # Algorithm hyperparameters
-initial_q = 50
+initial_q = 55
 rho = 50
-rho_1 = 0.5
+rho_1 = 1.2
 lip = 1
 split_threshold = 2
 scaling = 0.01
@@ -136,7 +136,7 @@ class AdaDiffEnvironment(Environment):
 
         reward = 0
         if self.timestep == self._final_step:
-            reward = (10 - new_state) * new_state
+            reward = (14 - new_state) * new_state
 
         self.state = new_state
         self.timestep += 1
@@ -247,7 +247,7 @@ class Node():
         self.children = None
 
     def split_node(self, flag, epLen):
-        half_radius = self.radius * 0.5  # CHANGE 14: Precompute halved values
+        half_radius = self.radius * 0.5 
         half_action_radius = self.action_radius * 0.5
         action_val = self.action_val
         state_val = self.state_val
@@ -280,7 +280,7 @@ class Tree():
     """Manages the hierarchy of nodes for a specific timestep."""
 
     def __init__(self, epLen, flag):
-        self.head = Node(initial_q, 0, 0, 0, 0, 0, 0, 0, np.full(action_dim, 0.5), rho, rho_1)
+        self.head = Node(initial_q, 0, 0, 0, 0, 0, 0, 0, np.full(action_dim, 1), rho, rho_1)
         self.epLen = epLen
         self.flag = flag
         self.state_leaves = [self.head.state_val]
@@ -400,9 +400,10 @@ class AdaptiveModelBasedDiscretization(Agent):
 
         if timestep != self._final_step:
             delta_state = newObs - obs
+            old_muEst = active_node.muEst
             active_node.muEst = t_minus_1_ratio * active_node.muEst + delta_state * inv_t
             active_node.sigmaEst = t_minus_1_ratio * active_node.sigmaEst + \
-                                   (delta_state - active_node.muEst) ** 2 * inv_t
+                                   (delta_state - old_muEst) ** 2 * inv_t
 
         if not self.flag:
             ucb_visit = self.scaling / math.sqrt(active_node.num_visits)
@@ -413,7 +414,8 @@ class AdaptiveModelBasedDiscretization(Agent):
                                        active_node.rEst + ucb_visit + ucb_radius)
             else:
                 next_tree = self.tree_list[timestep + 1]
-                vEst = next_tree._min_vEst + lip * (1 + active_node.muEst ** 2 + active_node.sigmaEst ** 2)
+                _, next_qVal = next_tree.get_active_ball(newObs)
+                vEst = next_qVal + lip * active_node.sigmaEst
                 active_node.qVal = min(active_node.qVal, initial_q,
                                        active_node.rEst + vEst + ucb_visit + ucb_radius)
 
@@ -424,7 +426,7 @@ class AdaptiveModelBasedDiscretization(Agent):
                 vEst_list[idx] = min(qMax, initial_q, vEst_list[idx])
             tree._update_min_vEst()
 
-        if t >= 2 ** (self.split_threshold * active_node.num_splits):
+        if t >= 5 + 2 ** (self.split_threshold * active_node.num_splits):
             if timestep >= 1:
                 tree.split_node(active_node, timestep, self.tree_list[timestep - 1])
             else:
@@ -478,7 +480,7 @@ def make_diffMDP(epLen, starting_state):
 
 def run_single_experiment_iteration(iteration_seed):
     env_single = make_diffMDP(epLen, starting_state)
-    agent_single = AdaptiveModelBasedDiscretization(epLen, nEps, scaling, split_threshold, False, False)
+    agent_single = AdaptiveModelBasedDiscretization(epLen, nEps, scaling, split_threshold, False, True)
     dictionary_single = {
         'seed': iteration_seed, 'epFreq': 1,
         'targetPath': './tmp_iter_{}.csv'.format(iteration_seed),
