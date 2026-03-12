@@ -176,7 +176,7 @@ class Experiment(object):
 
         for i in range(self.num_iters):
             agent = self.agent_list[i]
-            for ep in range(1, nEps + 1):
+            for ep in range(1, self.nEps + 1):
                 env.reset()
                 oldState = env.state
                 epReward = 0
@@ -489,18 +489,23 @@ def run_single_experiment_iteration(iteration_seed):
     dt_data_single = exp_single.save_data()
     return dt_data_single.epReward.values
 
-n = 50
+def main():
+    n = 50
+    list_of_vpi = Parallel(n_jobs=-1)(
+        delayed(run_single_experiment_iteration)(i) for i in range(n)
+    )
 
-list_of_vpi = Parallel(n_jobs=-1)(delayed(run_single_experiment_iteration)(i) for i in range(n))
+    vpi_df = pd.DataFrame(list_of_vpi).T
+    vpi_estimate = vpi_df.mean(axis=1)
 
-vpi_df = pd.DataFrame(list_of_vpi).T
-vpi_estimate = vpi_df.mean(axis=1)
+    plt.figure(figsize=(10, 6))
+    plt.plot(range(len(vpi_estimate)), vpi_estimate, label='vpi')
+    plt.xlabel("Episode")
+    plt.ylabel("vpi")
+    plt.title("vpi vs episode")
+    plt.legend()
+    plt.grid(True)
+    plt.show()
 
-plt.figure(figsize=(10, 6))
-plt.plot(range(len(vpi_estimate)), vpi_estimate, label='vpi')
-plt.xlabel("Episode")
-plt.ylabel("vpi")
-plt.title("vpi vs episode")
-plt.legend()
-plt.grid(True)
-plt.show()
+if __name__ == "__main__":
+    main()
