@@ -306,8 +306,11 @@ class Tree:
         self._vEst_dirty = False
 
     def get_active_ball_1d(self, state_scalar: float) -> Tuple[Node, float]:
-        """Find the deepest leaf node containing the given state (1D version)."""
-        cached = self._lookup_cache.get(state_scalar)
+        lo = self.head._state_center - self.head.radius
+        hi = self.head._state_center + self.head.radius
+        safe_state = min(max(state_scalar, lo), hi)
+
+        cached = self._lookup_cache.get(safe_state)
         if cached is not None and cached.children is None:
             return cached, cached.qVal
 
@@ -317,16 +320,17 @@ class Tree:
             best_q = -math.inf
 
             for child in node.children:
-                if child.contains_1d(state_scalar):
+                if child.contains_1d(safe_state):
                     if child.qVal >= best_q:
                         best_q = child.qVal
                         best_node = child
 
             if best_node is None:
                 break
+
             node = best_node
 
-        self._lookup_cache[state_scalar] = node
+        self._lookup_cache[safe_state] = node
         return node, node.qVal
 
     def get_active_ball(self, state: np.ndarray) -> Tuple[Node, float]:
