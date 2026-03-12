@@ -9,32 +9,23 @@ Research project
 with Conor and Aaro
 """
 import numpy as np
-import math  # CHANGE 1: Use math.sqrt for scalar operations (faster than np.sqrt)
+import math 
 import pandas as pd
 import matplotlib.pyplot as plt
 import itertools
 from joblib import Parallel, delayed
-# CHANGE 2: Removed unused imports: gymnasium, matplotlib.patches, mpl, os.path,
-# shutil.copyfile, pickle, time - reduces import overhead
 
 """"
 Notes: One-step update that doesn't use the full bellman update and go a planned path is so much better
 It basically takes the average ...
 
-To fix the out-of-bounds code: to advance after new_state, add: new_state = np.clip(new_state, -rho, rho)
-and to tree in get_active_ball:
-                            safe_state = np.clip(state, 
-                            self.head.state_val - self.head.radius, 
-                            self.head.state_val + self.head.radius)
-        
-                            active_node, qVal = self.get_active_ball_recursion(safe_state, self.head)
-                            return active_node, qVal
+To fix the out-of-bounds code: by forcing the new_state to be within the bounds
+and that agent always finds an active ball such that the code doesn't break.
 
 
 """
 
-
-# --- Core simulation parameters ---
+# Simulation parameters
 epLen = 30
 nEps = 2000
 numIters = 1
@@ -45,7 +36,7 @@ sigma = 0.2
 Delta = 1/52
 action_dim = 2
 
-# --- Algorithm hyperparameters ---
+# Algorithm hyperparameters
 initial_q = 50
 rho = 50
 rho_1 = 0.5
@@ -53,10 +44,11 @@ lip = 1
 split_threshold = 2
 scaling = 0.01
 
-# Precompute constants used repeatedly in hot loops
+# Precompute constants
 _SQRT_DELTA = math.sqrt(Delta) 
 _INV_ACTION_DIM = 1.0 / action_dim
-# Precompute the action offset array once at module level (was recomputed every split)
+
+# Precompute the action offset array
 _ACTION_OFFSETS = np.array(list(itertools.product([-1, 1], repeat=action_dim)), dtype=np.float64)
 _STATE_OFFSETS = np.array([-1, 1], dtype=np.float64)
 _NUM_ACTION_OFFSETS = 2 ** action_dim
@@ -300,7 +292,7 @@ class Tree():
         return self.head
 
     def _update_min_vEst(self):
-        """CHANGE 18: Helper to update cached min when vEst changes."""
+        """Helper to update cached min when vEst changes."""
         self._min_vEst = min(self.vEst)
 
     def split_node(self, node, timestep, previous_tree):
@@ -495,7 +487,6 @@ def run_single_experiment_iteration(iteration_seed):
     exp_single = Experiment(env_single, [agent_single], dictionary_single)
     exp_single.run()
     dt_data_single = exp_single.save_data()
-    # CHANGE 37: Return .values (numpy array) to avoid pickling overhead in joblib
     return dt_data_single.epReward.values
 
 n = 50
