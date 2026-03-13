@@ -31,18 +31,20 @@ nEps = 1500
 numIters = 1
 starting_state = 2
 theta = 0.05
-kappa = 0.8
+kappa = 0.10
 sigma = 0.2
 Delta = 1/52
 action_dim = 2
+r0 = 0.05
 
 # Algorithm hyperparameters
-initial_q = 55
+initial_q = 50
 rho = 50
-rho_1 = 1.2
+rho_1 = 0.5
 lip = 1
 split_threshold = 2
 scaling = 0.01
+excess_return = 0.1
 
 # Precompute constants
 _SQRT_DELTA = math.sqrt(Delta) 
@@ -53,6 +55,65 @@ _ACTION_OFFSETS = np.array(list(itertools.product([-1, 1], repeat=action_dim)), 
 _STATE_OFFSETS = np.array([-1, 1], dtype=np.float64)
 _NUM_ACTION_OFFSETS = 2 ** action_dim
 
+def project_to_simplex(v):
+    """Projects vector v onto the simplex a_i >= 0, sum(a_i) <= 1."""
+    v_clipped = np.maximum(v, 0)
+    if np.sum(v_clipped) <= 1.0:
+        return v_clipped
+    
+    u = np.sort(v)[::-1]
+    cssv = np.cumsum(u)
+    rho_idx = np.nonzero(u * np.arange(1, len(v) + 1) > (cssv - 1))[0][-1]
+    theta_val = (cssv[rho_idx] - 1) / (rho_idx + 1)
+    return np.maximum(v - theta_val, 0)
+
+def compute_optimal_value(x0, H, delta):
+    """
+    Compute V*(x0) analytically for the Merton-style problem.
+    
+    For this specific setup with V(x) = ||x||^2 + 101:
+    We approximate V* by running a large number of Monte Carlo simulations
+    with the theoretically optimal policy.
+    """
+    # For Merton's problem with log/power utility the optimal fraction is known.
+    # With V(x)=x^2+101 as terminal reward, the optimal policy maximizes E[X_H^2].
+    # 
+    # E[X_H^2] under constant portfolio a:
+    #   X follows geometric dynamics, so
+    #   E[X_H^2] = x0^2 * exp(2*(r0 + (bi-r0)*sum(a))*H*delta 
+    #              + sigma^2 * sum(a_i^2) * H * delta)
+    #
+    # To maximize: we want to maximize (bi-r0)*sum(a) + 0.5*sigma^2*sum(a_i^2)
+    # subject to a_i >= 0, sum(a_i) <= 1.
+    #
+    # Since excess_return > 0 and sigma^2 term also positive, optimal is sum(a_i)=1.
+    # For the sigma^2 term: sum(a_i^2) is maximized when all weight on one asset: a_i=1.
+    # But (bi-r0)*sum(a) is the same regardless of how we split among assets.
+    # So optimal: put all weight on one asset, a_1 = 1, rest = 0.
+    
+    n_mc = 200000
+    np.random.seed(42)
+    
+    a_opt = np.zeros(action_dim)
+    a_opt[0] = 1.0  # concentrate on one asset
+    
+    wealth = np.full(n_mc, float(x0))
+    
+    for h in range(H):
+        noise = np.random.randn(n_mc, action_dim)
+        action_sum = np.sum(a_opt)
+        dot_product = noise @ a_opt  # (n_mc,)
+        
+        drift = r0 + excess_return * action_sum
+        diffusion = sigma * dot_product
+        
+        wealth = wealth * (1 + drift * delta + diffusion * math.sqrt(delta))
+        wealth = np.clip(wealth, -rho, rho)
+    
+    terminal_reward = wealth ** 2 + 101
+    v_star = np.mean(terminal_reward)
+    
+    return v_star
 
 class Agent(object):
     """Abstract base class for a reinforcement learning agent."""
@@ -135,17 +196,20 @@ class AdaDiffEnvironment(Environment):
         new_state = np.clip(new_state, -rho, rho)
 
         reward = 0
+        pContinue = 1
+        
+        # Terminal reward function: R_H(x) = (10 - x)x
         if self.timestep == self._final_step:
-            reward = (14 - new_state) * new_state
+            reward = (10 - new_state) * new_state
 
         self.state = new_state
         self.timestep += 1
 
-        pContinue = 1
         if self.timestep == self.epLen:
             pContinue = 0
 
         return reward, new_state, pContinue
+        
 
 class Experiment(object):
 
@@ -280,7 +344,7 @@ class Tree():
     """Manages the hierarchy of nodes for a specific timestep."""
 
     def __init__(self, epLen, flag):
-        self.head = Node(initial_q, 0, 0, 0, 0, 0, 0, 0, np.full(action_dim, 1), rho, rho_1)
+        self.head = Node(initial_q, 0, 0, 0, 0, 0, 0, 0, np.full(action_dim, 0.5), rho, rho_1)
         self.epLen = epLen
         self.flag = flag
         self.state_leaves = [self.head.state_val]
@@ -426,7 +490,7 @@ class AdaptiveModelBasedDiscretization(Agent):
                 vEst_list[idx] = min(qMax, initial_q, vEst_list[idx])
             tree._update_min_vEst()
 
-        if t >= 5 + 2 ** (self.split_threshold * active_node.num_splits):
+        if t >= 2 ** (self.split_threshold * active_node.num_splits):
             if timestep >= 1:
                 tree.split_node(active_node, timestep, self.tree_list[timestep - 1])
             else:
@@ -463,11 +527,11 @@ class AdaptiveModelBasedDiscretization(Agent):
         tree = self.tree_list[timestep]
         active_node, _ = tree.get_active_ball(state)
 
-        action = _INV_ACTION_DIM * np.random.uniform(
+        action = np.random.uniform(
             active_node.action_val - active_node.action_radius,
             active_node.action_val + active_node.action_radius
         )
-        return action
+        return project_to_simplex(action)
 
     def pick_action(self, state, timestep):
         action = self.greedy(state, timestep)
@@ -480,7 +544,7 @@ def make_diffMDP(epLen, starting_state):
 
 def run_single_experiment_iteration(iteration_seed):
     env_single = make_diffMDP(epLen, starting_state)
-    agent_single = AdaptiveModelBasedDiscretization(epLen, nEps, scaling, split_threshold, False, True)
+    agent_single = AdaptiveModelBasedDiscretization(epLen, nEps, scaling, split_threshold, False, False)
     dictionary_single = {
         'seed': iteration_seed, 'epFreq': 1,
         'targetPath': './tmp_iter_{}.csv'.format(iteration_seed),
