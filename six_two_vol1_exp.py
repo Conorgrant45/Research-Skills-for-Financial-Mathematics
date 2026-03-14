@@ -10,7 +10,7 @@ from joblib import Parallel, delayed
 # ============================================================
 # SIMULATION PARAMETERS — tuned for visible learning
 # ============================================================
-epLen = 20
+epLen = 30
 nEps = 2000
 numIters = 1
 starting_state = 2

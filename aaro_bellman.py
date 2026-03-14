@@ -283,7 +283,6 @@ class BellmanSolver:
         ax.legend(fontsize=10)
         ax.grid(True, linestyle='--', alpha=0.4)
         plt.tight_layout()
-        plt.savefig('bellman_value_functions.png', dpi=150, bbox_inches='tight')
         plt.show()
 
     def plot_value_function_zoomed(self, x_range=(0, 6)):
@@ -311,7 +310,6 @@ class BellmanSolver:
         ax.legend(fontsize=10)
         ax.grid(True, linestyle='--', alpha=0.4)
         plt.tight_layout()
-        plt.savefig('bellman_value_zoomed.png', dpi=150, bbox_inches='tight')
         plt.show()
 
     def plot_optimal_policy(self):
@@ -359,7 +357,6 @@ class BellmanSolver:
 
         plt.suptitle('Optimal Policy: Action Allocations vs State', fontsize=14)
         plt.tight_layout()
-        plt.savefig('bellman_optimal_policy.png', dpi=150, bbox_inches='tight')
         plt.show()
 
     def plot_trajectory_distribution(self, x0=2.0, n_sims=5000):
@@ -409,7 +406,6 @@ class BellmanSolver:
         ax.grid(True, linestyle='--', alpha=0.4)
 
         plt.tight_layout()
-        plt.savefig('bellman_trajectories.png', dpi=150, bbox_inches='tight')
         plt.show()
 
     def plot_policy_heatmap(self):
@@ -437,5 +433,4 @@ class BellmanSolver:
         ax.set_title('Optimal Policy Heatmap: Total Risky Allocation', fontsize=14)
         ax.legend(fontsize=10, loc='upper right')
         plt.tight_layout()
-        plt.savefig('bellman_policy_heatmap.png', dpi=150, bbox_inches='tight')
         plt.show()
