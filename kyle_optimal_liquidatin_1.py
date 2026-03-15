@@ -62,7 +62,7 @@ mean_start = 100.0
 mean_end = 95.0            # declining long-run mean over the horizon
 
 # Liquidation economics
-eta_temp = 20             # temporary impact coefficient
+eta_temp = 200             # temporary impact coefficient
 theta_terminal = 120.0     # penalty for leftover inventory
 
 # Keep these names to minimise code changes elsewhere
