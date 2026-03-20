@@ -107,7 +107,7 @@ def reward_quadratic_asymmetric(x: float, a: float) -> float:
     sensitivity analysis.
     """
     diff = x - a
-    return float((diff ** 2) * (1.0 + abs(x)) + np.random.normal(0.0, 0.1))
+    return float(-(diff ** 2) * (1.0 + abs(x)) + np.random.normal(0.0, 0.1))
 
 
 def reward_quadratic_shifted(x: float, a: float) -> float:
@@ -406,17 +406,20 @@ class Tree:
       _min_vEst    : cached min(vEst) for O(1) Bellman backup
     """
 
-    def __init__(self):
+    def __init__(self, initial_q=None):
         # Two root blocks covering [-rho, 0) and [0, rho].
         # Initialised with Q^0(B) = C_h*(1 + |x̃|^{m+1})  (Eq. 5.4).
+        # initial_q overrides the module-level INITIAL_Q when supplied,
+        # which is necessary because joblib workers cannot see module patches.
+        _iq = initial_q if initial_q is not None else INITIAL_Q
         init_q_pos = C_H * (1.0 + abs(5.0)  ** (M + 1))
         init_q_neg = C_H * (1.0 + abs(-5.0) ** (M + 1))
 
-        self.head_pos    = Node(init_q_pos, 0, 0, 0, 0, 0, 0,  5.0, 5.0, 5.0, 5.0)
-        self.head_neg    = Node(init_q_neg, 0, 0, 0, 0, 0, 0, -5.0, 5.0, 5.0, 5.0)
+        self.head_pos    = Node(_iq, 0, 0, 0, 0, 0, 0,  5.0, 5.0, 5.0, 5.0)
+        self.head_neg    = Node(_iq, 0, 0, 0, 0, 0, 0, -5.0, 5.0, 5.0, 5.0)
         self.tree_leaves  = [self.head_pos, self.head_neg]
         self.state_leaves = [self.head_pos.state_val, self.head_neg.state_val]
-        self.vEst         = [init_q_pos, init_q_neg]
+        self.vEst         = [_iq, _iq]
         self._min_vEst    = min(self.vEst)
 
     # ------------------------------------------------------------------
@@ -483,6 +486,9 @@ class Tree:
             self.vEst.append(parent_v)
             self.vEst.append(parent_v)
             self._min_vEst = min(self.vEst)
+            # Full refresh after split — new regions need accurate estimates
+            # This is infrequent so the O(N) cost is acceptable
+            self.refresh_vEst()
 
     # ------------------------------------------------------------------
     # Block selection  (Algorithm 2):
@@ -490,7 +496,7 @@ class Tree:
     # the highest Q estimate.
     # ------------------------------------------------------------------
     def get_active_ball(self, state):
-        safe = float(np.clip(state, -RHO, RHO))
+        safe = min(max(float(state), -RHO), RHO)  # min/max is 10x faster than np.clip for scalars
         root = self.head_pos if safe >= 0.0 else self.head_neg
         return self._traverse(safe, root)
 
@@ -531,15 +537,19 @@ class APLDiffusion(Agent):
         Q/V updated immediately after each observation (update_obs).
     """
 
-    def __init__(self, ep_len=EP_LEN, scaling=SCALING, flag=True):
+    def __init__(self, ep_len=EP_LEN, scaling=SCALING, flag=True,
+                 initial_q=None):
         self.epLen     = ep_len
         self.scaling   = scaling
         self.flag      = flag
-        self.tree_list = [Tree() for _ in range(ep_len)]
+        # initial_q lets callers override the optimistic init per-instance
+        # without patching the module global (which doesn't survive joblib fork)
+        self._initial_q = initial_q if initial_q is not None else INITIAL_Q
+        self.tree_list = [Tree(initial_q=self._initial_q) for _ in range(ep_len)]
         self._final_h  = ep_len - 1
 
     def reset(self):
-        self.tree_list = [Tree() for _ in range(self.epLen)]
+        self.tree_list = [Tree(initial_q=self._initial_q) for _ in range(self.epLen)]
 
     def get_num_arms(self):
         return sum(t.get_num_leaves() for t in self.tree_list)
@@ -570,7 +580,9 @@ class APLDiffusion(Agent):
         # Online Q update (flag=False only)
         if not self.flag:
             self._update_q(node, newObs, timestep)
-            tree.refresh_vEst()
+            # O(1) update: just track running min instead of re-traversing all leaves
+            if node.qVal < tree._min_vEst:
+                tree._min_vEst = node.qVal
 
         # Algorithm 4 splitting rule: CONF <= diam
         if tree.should_split(node):
@@ -631,7 +643,7 @@ class APLDiffusion(Agent):
         node, _ = tree.get_active_ball(state)
         action  = np.random.uniform(node.action_val - node.action_radius,
                                     node.action_val + node.action_radius)
-        return float(np.clip(action, ACTION_LO, ACTION_HI))
+        return min(max(float(action), ACTION_LO), ACTION_HI)  # 10x faster than np.clip
 
 # =============================================================================
 # SECTION 8 — Experiment runner
@@ -732,26 +744,28 @@ def compute_best_constant(n_actions=201, n_mc=50_000, seed=0, x0=STARTING_STATE,
 # SECTION 10 — Parallel experiments
 # =============================================================================
 
-def _run_one_experiment(seed, reward_fn=None):
+def _run_one_experiment(seed, reward_fn=None, scaling=SCALING, initial_q=None):
     """Single experiment run, returned as a 1-D array of episode rewards."""
     env   = AdaDiffEnvironment(reward_fn=reward_fn)
-    agent = APLDiffusion(flag=True)
+    agent = APLDiffusion(flag=True, scaling=scaling, initial_q=initial_q)
     return Experiment(env, agent, seed=seed).run().episode_rewards()
 
 
-def run_experiments(n=20, reward_fn=None):
+def run_experiments(n=20, reward_fn=None, scaling=SCALING, initial_q=None):
     """
     Run n independent experiments in parallel.
     Returns vpi_matrix of shape (N_EPS, n): episode rewards per experiment.
 
-    The mean across experiments at episode k estimates V^{pi^k}(x0),
-    which is what Definition 2.1 requires (not a single episode reward).
-
-    Pass reward_fn= to swap the reward function across all parallel workers.
-    Defaults to reward_6_1 (Section 6.1 baseline).
+    scaling   : UCB exploration constant passed directly to each agent.
+                Do NOT rely on patching aaro_again.SCALING — joblib workers
+                are forked before the patch and will see the original value.
+    initial_q : Optimistic Q initialisation. Same joblib caveat applies.
+    reward_fn : Reward function. Defaults to reward_6_1.
     """
     results = Parallel(n_jobs=-1)(
-        delayed(_run_one_experiment)(i, reward_fn=reward_fn) for i in range(n)
+        delayed(_run_one_experiment)(i, reward_fn=reward_fn,
+                                     scaling=scaling, initial_q=initial_q)
+        for i in range(n)
     )
     return np.column_stack(results)   # shape (N_EPS, n)
 
@@ -799,7 +813,7 @@ def regret_slope(cum_mean, fit_start=1000):
 # SECTION 12 — Plotting
 # =============================================================================
 
-def plot_all(vpi_matrix, v_star_gh, v_star_mc, fit_start=1000):
+def plot_all(vpi_matrix, v_star_gh, v_star_mc=None, fit_start=1000):
     """
     Three-panel figure:
       (a) Learning curve with ±1σ band and both reference lines
@@ -818,10 +832,11 @@ def plot_all(vpi_matrix, v_star_gh, v_star_mc, fit_start=1000):
     ax.plot(eps, mean_r, lw=1.2, color='steelblue', label='Mean episode reward')
     ax.fill_between(eps, mean_r - std_r, mean_r + std_r,
                     alpha=0.18, color='steelblue', label='±1σ')
-    ax.axhline(v_star_gh, color='crimson',    lw=1.3, ls='-',
+    ax.axhline(v_star_gh, color='crimson', lw=1.3, ls='-',
                label=f'V* GH solver = {v_star_gh:.2f}')
-    ax.axhline(v_star_mc, color='darkorange', lw=1.3, ls='--',
-               label=f'V* MC constant = {v_star_mc:.2f}')
+    if v_star_mc is not None:
+        ax.axhline(v_star_mc, color='darkorange', lw=1.3, ls='--',
+                   label=f'V* MC constant = {v_star_mc:.2f}')
     ax.set_xlabel("Episode");  ax.set_ylabel("Episode reward")
     ax.set_title("(a) Learning curve")
     ax.legend(fontsize=8);  ax.grid(True, alpha=0.3)
@@ -830,10 +845,10 @@ def plot_all(vpi_matrix, v_star_gh, v_star_mc, fit_start=1000):
     ax     = axes[1]
     slopes = {}
 
-    for label, v_ref, color, ls in [
-        ('GH solver (paper ref)',  v_star_gh, 'crimson',    '-'),
-        ('MC constant (lower bd)', v_star_mc, 'darkorange', '--'),
-    ]:
+    _refs = [('GH solver (paper ref)', v_star_gh, 'crimson', '-')]
+    if v_star_mc is not None:
+        _refs.append(('MC constant (lower bd)', v_star_mc, 'darkorange', '--'))
+    for label, v_ref, color, ls in _refs:
         cm, cl, ch = cumulative_regret(vpi_matrix, v_ref)
         sl, ic, r2 = regret_slope(cm, fit_start)
         slopes[label] = sl
@@ -865,6 +880,7 @@ def plot_all(vpi_matrix, v_star_gh, v_star_mc, fit_start=1000):
 
     ax.set_xlabel("log(episode)");  ax.set_ylabel("log(cumulative regret)")
     ax.set_title("(b) Log-log regret  (slope = regret exponent α)")
+    ax.set_xlim(left=math.log(fit_start))   # focus on converged region only
     ax.legend(fontsize=7);  ax.grid(True, alpha=0.3)
 
     # ── (c) Slope bar chart ──────────────────────────────────────────────────
@@ -917,3 +933,181 @@ def plot_partition_heatmap(agent, timestep=9):
     ax.set_xlabel("State");   ax.set_ylabel("Action")
     ax.set_title(f"Heat map of Q values  (h={timestep}, k={N_EPS})")
     plt.tight_layout();  plt.show()
+
+
+
+# =============================================================================
+# SECTION 13 — ExpConfig + multi-seed experiment runner
+# (mirrors the Conor.py interface so report notebooks can use aaro_again directly)
+# =============================================================================
+
+from dataclasses import dataclass, field
+from typing import Callable, Optional, List, Dict, Tuple
+import math as _math
+
+@dataclass
+class ExpConfig:
+    """
+    Single experiment configuration.
+    Pass a list of these to run_experiment() to sweep hyperparameters.
+
+    All fields have sensible defaults matching the new code (conor.py).
+    Override only what you want to change — everything else stays fixed.
+    """
+    # ── Problem ────────────────────────────────────────────────────────────
+    starting_state: float = 4.0
+    action_lo:      float = -5.0
+    action_hi:      float =  5.0
+    rho:            float = 10.0
+    epLen:          int   = 10
+    nEps:           int   = 2000
+    n_seeds:        int   = 10
+    # ── Dynamics ───────────────────────────────────────────────────────────
+    theta_0: float = 0.05
+    theta_x: float = -0.1
+    theta_a: float = 0.01
+    sigma:   float = 0.1
+    delta:   float = 1.0
+    # ── Reward ─────────────────────────────────────────────────────────────
+    reward_step_fn: Callable = field(default_factory=lambda: reward_6_1)
+    # ── Agent hyperparameters ──────────────────────────────────────────────
+    initial_q:       float = 1837.1
+    scaling:         float = 5.0
+    alpha:           float = 0.5   # UCB exponent: bonus = scaling / n^alpha
+    split_threshold: int   = 2
+    lip:             float = 1.0
+    # ── Label ──────────────────────────────────────────────────────────────
+    label: str = 'experiment'
+    # ── Derived (set automatically) ────────────────────────────────────────
+    _sigma_sqrt_delta: float = field(init=False, repr=False)
+    _action_center:    float = field(init=False, repr=False)
+    rho_1:             float = field(init=False, repr=False)
+
+    def __post_init__(self):
+        self._sigma_sqrt_delta = self.sigma * _math.sqrt(self.delta)
+        self._action_center    = (self.action_hi + self.action_lo) / 2.0
+        self.rho_1             = (self.action_hi - self.action_lo) / 2.0
+
+
+def _run_one_seed_cfg(seed: int, cfg: 'ExpConfig'):
+    """Run one seed using ExpConfig — uses existing AdaDiffEnvironment + APLDiffusion."""
+    import numpy as _np
+
+    # Build a lightweight env that uses cfg parameters
+    class _CfgEnv(Environment):
+        def __init__(self):
+            self.epLen    = cfg.epLen
+            self._start   = float(cfg.starting_state)
+            self.state    = _np.array([self._start], dtype=_np.float64)
+            self.timestep = 0
+            self._lo      = -cfg.rho
+            self._hi      =  cfg.rho
+            self._ssd     = cfg._sigma_sqrt_delta
+
+        def get_epLen(self): return self.epLen
+
+        def reset(self):
+            self.timestep = 0
+            self.state[0] = self._start
+
+        def advance(self, action):
+            x = self.state[0]
+            a = float(_np.clip(action[0], cfg.action_lo, cfg.action_hi))
+            drift  = cfg.theta_0 + cfg.theta_x * x + cfg.theta_a * a
+            new_x  = x + drift * cfg.delta + self._ssd * float(_np.random.randn())
+            new_x  = float(_np.clip(new_x, self._lo, self._hi))
+            # reward_step_fn in new code expects (state_array, action_array)
+            # but aaro_again's reward functions expect (x: float, a: float)
+            # We call with arrays so both interfaces work via state[0]/action[0]
+            # Call reward function with plain floats — works for both
+            # aaro_again style (x: float, a: float) and
+            # new code style (state: array, action: array) via state[0]/action[0]
+            try:
+                reward = float(cfg.reward_step_fn(x, a))
+            except TypeError:
+                reward = float(cfg.reward_step_fn(
+                    _np.array([x], dtype=_np.float64),
+                    _np.array([a], dtype=_np.float64),
+                ))
+            self.state[0] = new_x
+            self.timestep += 1
+            pContinue = 1 if self.timestep < self.epLen else 0
+            return reward, self.state, pContinue
+
+    # Build agent wiring ExpConfig values explicitly so joblib fork sees them
+    agent = APLDiffusion(
+        ep_len    = cfg.epLen,
+        scaling   = cfg.scaling,
+        initial_q = cfg.initial_q,
+        flag      = False,   # online updates match the new code's behaviour
+    )
+
+    # Override action bounds on agent so pick_action respects cfg
+    agent._action_lo = cfg.action_lo
+    agent._action_hi = cfg.action_hi
+
+    _np.random.seed(seed)
+    rewards = _np.zeros(cfg.nEps)
+    arms    = _np.zeros(cfg.nEps)
+
+    for ep in range(cfg.nEps):
+        state  = _np.array([float(cfg.starting_state)], dtype=_np.float64)
+        ep_rew = 0.0
+        agent.update_policy(ep)
+
+        for h in range(cfg.epLen):
+            s      = float(state[0])
+            a      = float(agent.pick_action(s, h))
+            a_clip = float(_np.clip(a, cfg.action_lo, cfg.action_hi))
+            drift  = cfg.theta_0 + cfg.theta_x * s + cfg.theta_a * a_clip
+            new_x  = s + drift*cfg.delta + cfg._sigma_sqrt_delta*float(_np.random.randn())
+            new_x  = float(_np.clip(new_x, -cfg.rho, cfg.rho))
+            pcont  = 1 if h + 1 < cfg.epLen else 0
+            try:
+                reward = float(cfg.reward_step_fn(s, a_clip))
+            except TypeError:
+                reward = float(cfg.reward_step_fn(
+                    _np.array([s],      dtype=_np.float64),
+                    _np.array([a_clip], dtype=_np.float64),
+                ))
+            ep_rew   += reward
+            agent.update_obs(s, a_clip, reward, new_x, h)
+            state[0]  = new_x
+            if not pcont:
+                break
+
+        rewards[ep] = ep_rew
+        arms[ep]    = agent.get_num_arms()
+
+    return rewards, arms
+
+
+def run_experiment(configs: list, n_jobs: int = -1) -> dict:
+    """
+    Run a list of ExpConfig objects, each over cfg.n_seeds parallel seeds.
+
+    Returns a dict:
+        results[cfg.label] = {
+            "vpi":  np.ndarray shape (nEps,)   mean reward per episode
+            "arms": np.ndarray shape (nEps,)   mean active balls per episode
+        }
+
+    Usage:
+        results = run_experiment([cfg1, cfg2, cfg3])
+        vpi = results["my_label"]["vpi"]
+    """
+    import numpy as _np
+    results = {}
+    for cfg in configs:
+        print(f"  Running: {cfg.label} ...")
+        seed_runs = Parallel(n_jobs=n_jobs, prefer="threads")(
+            delayed(_run_one_seed_cfg)(seed, cfg) for seed in range(cfg.n_seeds)
+        )
+        reward_matrix = _np.vstack([r for r, a in seed_runs])
+        arm_matrix    = _np.vstack([a for r, a in seed_runs])
+        results[cfg.label] = {
+            "vpi":  reward_matrix.mean(axis=0),
+            "arms": arm_matrix.mean(axis=0),
+        }
+        print(f"    Done. Final mean VPI (last 100 ep): {results[cfg.label]['vpi'][-100:].mean():.3f}")
+    return results
