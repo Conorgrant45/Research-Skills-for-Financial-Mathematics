@@ -37,7 +37,7 @@ def reward_quadratic_shifted(state: np.ndarray, action: np.ndarray) -> float:
     """
     x, a = state[0], action[0]
     diff = x - a - 0.5
-    return -(diff ** 2) + np.random.normal(0.0, 0.01)
+    return -(diff ** 2)+10  + np.random.normal(0.0, 0.01)
 
 
 def reward_quartic(state: np.ndarray, action: np.ndarray) -> float:
