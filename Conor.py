@@ -83,12 +83,11 @@ class ExpConfig:
     reward_step_fn: Callable = field(default_factory=lambda: reward_6_1)
     label: str = 'Section 6.1'
     _sigma_sqrt_delta: float = field(init=False, repr=False)
-    _action_center: float = field(init=False, repr=False)
+    action_center: Optional[float] = None
 
     def __post_init__(self):
         self._sigma_sqrt_delta = self.sigma * math.sqrt(self.delta)
         self._action_center = (self.action_hi + self.action_lo) / 2.0
-        # Ensure rho_1 is consistent with action bounds
         self.rho_1 = (self.action_hi - self.action_lo) / 2.0
 
 
